@@ -6,6 +6,29 @@ import pandas as pd
 class LabelGenerator:
     """Generate future-return labels from the next N candles."""
 
+    def calculate_future_returns(self, df: pd.DataFrame, prediction_horizon: int) -> pd.DataFrame:
+        if prediction_horizon <= 0:
+            raise ValueError("predictionHorizon must be greater than zero")
+
+        result = df.copy()
+        required_columns = {"symbol_token", "timeframe", "close"}
+        if not required_columns.issubset(result.columns):
+            raise ValueError("symbol_token, timeframe, and close columns are required")
+        if "candle_time" in result.columns:
+            result = result.sort_values(
+                ["symbol_token", "timeframe", "candle_time"]
+            ).reset_index(drop=True)
+        else:
+            result = result.reset_index(drop=True)
+
+        group_columns = ["symbol_token", "timeframe"]
+        result["future_close"] = result.groupby(group_columns, dropna=False)["close"].shift(-prediction_horizon)
+        result["future_return_pct"] = (
+            (result["future_close"] - result["close"])
+            / result["close"].replace(0, float("nan"))
+        ) * 100.0
+        return result
+
     def generate_labels(
         self,
         df: pd.DataFrame,
@@ -20,18 +43,7 @@ class LabelGenerator:
         if sell_threshold_pct >= 0:
             raise ValueError("sellThresholdPct must be negative")
 
-        result = df.copy()
-        if "symbol_token" not in result.columns or "timeframe" not in result.columns:
-            raise ValueError("symbol_token and timeframe columns are required")
-        if "candle_time" in result.columns:
-            result = result.sort_values(["symbol_token", "timeframe", "candle_time"]).reset_index(drop=True)
-        else:
-            result = result.reset_index(drop=True)
-
-        result["future_close"] = result.groupby(["symbol_token", "timeframe"], dropna=False)["close"].shift(-prediction_horizon)
-        result["future_return_pct"] = (
-            (result["future_close"] - result["close"]) / result["close"].replace(0, float("nan"))
-        ) * 100.0
+        result = self.calculate_future_returns(df, prediction_horizon)
 
         result["label"] = "HOLD"
         result.loc[result["future_return_pct"] >= buy_threshold_pct, "label"] = "BUY"

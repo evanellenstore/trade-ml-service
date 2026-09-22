@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -11,8 +12,8 @@ class DatasetRequest(BaseModel):
     predictionHorizon: int = Field(default=15, ge=1)
     buyThresholdPct: float = Field(default=0.5)
     sellThresholdPct: float = Field(default=-0.5)
-    startTime: datetime | None = None
-    endTime: datetime | None = None
+    startTime: Optional[datetime] = None
+    endTime: Optional[datetime] = None
 
     @field_validator("timeframe")
     @classmethod

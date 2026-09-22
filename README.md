@@ -131,9 +131,9 @@ Set the following variables:
 ```bash
 DB_HOST=localhost
 DB_PORT=3306
-DB_NAME=trade_db
-DB_USERNAME=trade_user
-DB_PASSWORD=your_password_here
+DB_NAME=tradding_db
+DB_USERNAME=root
+DB_PASSWORD=ellenverma
 LOG_LEVEL=INFO
 DEFAULT_PREDICTION_HORIZON=15
 DEFAULT_BUY_THRESHOLD_PCT=0.5

@@ -4,6 +4,7 @@ from fastapi import FastAPI
 
 from app.api.dataset_api import router as dataset_router
 from app.api.health_api import router as health_router
+from app.api.target_analysis_api import router as target_analysis_router
 from app.config.logging_config import configure_logging
 
 configure_logging()
@@ -16,6 +17,7 @@ app = FastAPI(
 
 app.include_router(health_router)
 app.include_router(dataset_router)
+app.include_router(target_analysis_router)
 
 
 @app.get("/")

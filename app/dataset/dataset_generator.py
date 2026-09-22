@@ -8,7 +8,6 @@ import pandas as pd
 
 from app.dataset.label_generator import LabelGenerator
 from app.features.feature_engineering import FeatureEngineering
-from app.repository.market_data_repository import MarketDataRepository
 from app.schemas.dataset_schema import DatasetSummary
 
 logger = logging.getLogger(__name__)
@@ -34,7 +33,7 @@ class DatasetGenerator:
     ]
 
     def __init__(self) -> None:
-        self.repository = MarketDataRepository()
+        self.repository = None
         self.feature_engineering = FeatureEngineering()
         self.label_generator = LabelGenerator()
 
@@ -49,6 +48,10 @@ class DatasetGenerator:
         end_time: datetime | None = None,
     ) -> DatasetSummary:
         started_at = time.time()
+        if self.repository is None:
+            from app.repository.market_data_repository import MarketDataRepository
+
+            self.repository = MarketDataRepository()
         source_df = self.repository.fetch_market_data(symbol_token, timeframe, start_time, end_time)
 
         if source_df.empty:
