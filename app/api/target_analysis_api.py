@@ -17,10 +17,11 @@ def analyze_target(payload: TargetAnalysisRequest) -> TargetAnalysisResponse:
         data = TargetAnalysisService().analyze(
             symbol_token=payload.symbolToken,
             timeframe=payload.timeframe,
-            prediction_horizons=payload.predictionHorizons,
+            prediction_horizons_bars=payload.predictionHorizonsBars,
             thresholds_pct=payload.thresholdsPct,
             start_time=payload.startTime,
             end_time=payload.endTime,
+            trading_style=payload.tradingStyle,
         )
         return TargetAnalysisResponse(
             success=True,

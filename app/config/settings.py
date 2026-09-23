@@ -27,7 +27,7 @@ class Settings(BaseSettings):
 
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
 
-    default_prediction_horizon: int = Field(default=15, alias="DEFAULT_PREDICTION_HORIZON")
+    default_prediction_horizon_bars: int = Field(default=15, alias="DEFAULT_PREDICTION_HORIZON_BARS")
     default_buy_threshold_pct: float = Field(default=0.5, alias="DEFAULT_BUY_THRESHOLD_PCT")
     default_sell_threshold_pct: float = Field(default=-0.5, alias="DEFAULT_SELL_THRESHOLD_PCT")
 

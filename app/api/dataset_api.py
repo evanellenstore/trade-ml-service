@@ -18,9 +18,10 @@ def generate_dataset(payload: DatasetRequest) -> DatasetGenerationResponse:
         dataset_summary = generator.generate_dataset(
             symbol_token=payload.symbolToken,
             timeframe=payload.timeframe,
-            prediction_horizon=payload.predictionHorizon,
+            prediction_horizon_bars=payload.predictionHorizonBars,
             buy_threshold_pct=payload.buyThresholdPct,
             sell_threshold_pct=payload.sellThresholdPct,
+            trading_style=payload.tradingStyle,
             start_time=payload.startTime,
             end_time=payload.endTime,
         )

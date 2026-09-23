@@ -3,6 +3,7 @@ import pytest
 
 from app.dataset.label_generator import LabelGenerator
 from app.dataset.target_analysis_service import TargetAnalysisService
+from app.domain.trading_style import TradingStyle
 from app.schemas.target_analysis_schema import TargetAnalysisRequest
 
 
@@ -68,7 +69,7 @@ def test_analysis_supports_multiple_horizons_thresholds_and_one_repository_call(
     )
 
     assert repository.calls == 1
-    assert [item.predictionHorizon for item in result.analysis] == [1, 5]
+    assert [item.predictionHorizonBars for item in result.analysis] == [1, 5]
     assert [item.thresholdPct for item in result.analysis[0].thresholdAnalysis] == [1, 2]
     assert result.analysis[0].validTargetRows == 7
     assert result.analysis[0].skippedRows == 1
@@ -98,12 +99,12 @@ def test_request_deduplicates_and_sorts_inputs():
     request = TargetAnalysisRequest(
         symbolToken="A",
         timeframe="one_minute",
-        predictionHorizons=[30, 5, 30, 15],
+        predictionHorizonsBars=[30, 5, 30, 15],
         thresholdsPct=[0.5, 0.1, 0.5, 0.2],
     )
 
     assert request.timeframe == "ONE_MINUTE"
-    assert request.predictionHorizons == [5, 15, 30]
+    assert request.predictionHorizonsBars == [5, 15, 30]
     assert request.thresholdsPct == [0.1, 0.2, 0.5]
 
 
@@ -118,3 +119,80 @@ def test_future_return_is_not_a_feature():
     from app.dataset.dataset_generator import DatasetGenerator
 
     assert "future_return_pct" not in DatasetGenerator.FEATURE_COLUMNS
+
+
+def test_intraday_target_does_not_cross_trading_date():
+    day1 = pd.date_range("2026-09-21 09:15", periods=5, freq="min")
+    day2 = pd.date_range("2026-09-22 09:15", periods=5, freq="min")
+    source = pd.DataFrame(
+        {
+            "candle_id": range(10),
+            "symbol_token": ["A"] * 10,
+            "timeframe": ["ONE_MINUTE"] * 10,
+            "candle_time": list(day1) + list(day2),
+            "close": [100, 101, 102, 103, 104, 200, 201, 202, 203, 204],
+        }
+    )
+
+    result = LabelGenerator().generate_labels(
+        source,
+        prediction_horizon_bars=2,
+        buy_threshold_pct=0.5,
+        sell_threshold_pct=-0.5,
+        trading_style=TradingStyle.INTRADAY,
+    )
+
+    assert result["future_close"].notna().sum() == 6
+    assert result.iloc[2]["future_close"] == 104
+    assert result.iloc[3]["future_close"] is pd.NA or pd.isna(result.iloc[3]["future_close"])
+    assert pd.isna(result.iloc[-1]["future_close"])
+
+
+def test_swing_allows_cross_trading_date():
+    day1 = pd.date_range("2026-09-21 09:15", periods=3, freq="min")
+    day2 = pd.date_range("2026-09-22 09:15", periods=3, freq="min")
+    source = pd.DataFrame(
+        {
+            "candle_id": range(6),
+            "symbol_token": ["A"] * 6,
+            "timeframe": ["ONE_MINUTE"] * 6,
+            "candle_time": list(day1) + list(day2),
+            "close": [100, 101, 102, 200, 201, 202],
+        }
+    )
+
+    result = LabelGenerator().generate_labels(
+        source,
+        prediction_horizon_bars=1,
+        buy_threshold_pct=0.5,
+        sell_threshold_pct=-0.5,
+        trading_style=TradingStyle.SWING,
+    )
+
+    assert result.iloc[0]["future_close"] == 101
+    assert result.iloc[2]["future_close"] == 200
+    assert result.iloc[3]["future_close"] == 201
+
+
+def test_target_analysis_request_accepts_bars_name_and_trading_style():
+    request = TargetAnalysisRequest(
+        symbolToken="A",
+        timeframe="ONE_MINUTE",
+        tradingStyle="INTRADAY",
+        predictionHorizonsBars=[1, 2],
+        thresholdsPct=[0.5],
+    )
+
+    assert request.tradingStyle == TradingStyle.INTRADAY
+    assert request.predictionHorizonsBars == [1, 2]
+
+
+def test_prediction_horizon_bars_must_be_positive():
+    with pytest.raises(ValueError):
+        LabelGenerator().generate_labels(
+            candles([100, 101, 102]),
+            prediction_horizon_bars=0,
+            buy_threshold_pct=0.5,
+            sell_threshold_pct=-0.5,
+            trading_style=TradingStyle.SWING,
+        )

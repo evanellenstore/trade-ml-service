@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from app.dataset.label_generator import LabelGenerator
+from app.domain.trading_style import TradingStyle
 from app.schemas.target_analysis_schema import (
     ClassMetric,
     DistributionStatistics,
@@ -36,17 +37,20 @@ class TargetAnalysisService:
         self,
         symbol_token: str,
         timeframe: str,
-        prediction_horizons: list[int],
-        thresholds_pct: list[float],
+        prediction_horizons_bars: list[int],
+        thresholds_pct: list[float] | None = None,
         start_time: datetime | None = None,
         end_time: datetime | None = None,
+        trading_style: TradingStyle | str = TradingStyle.INTRADAY,
     ) -> TargetAnalysisData:
-        if not prediction_horizons or any(horizon <= 0 for horizon in prediction_horizons):
-            raise ValueError("predictionHorizons must contain only values greater than zero")
-        if not thresholds_pct or any(not math.isfinite(threshold) or threshold <= 0 for threshold in thresholds_pct):
+        prediction_horizons_bars = sorted(set(prediction_horizons_bars))
+
+        if not prediction_horizons_bars or any(horizon <= 0 for horizon in prediction_horizons_bars):
+            raise ValueError("predictionHorizonsBars must contain only values greater than zero")
+        if thresholds_pct is None or not thresholds_pct or any(not math.isfinite(threshold) or threshold <= 0 for threshold in thresholds_pct):
             raise ValueError("thresholdsPct must contain only positive values")
-        prediction_horizons = sorted(set(prediction_horizons))
         thresholds_pct = sorted(set(thresholds_pct))
+        trading_style = TradingStyle.normalize(trading_style)
 
         source_df = self.repository.fetch_market_data(symbol_token, timeframe, start_time, end_time)
         source_row_count = len(source_df)
@@ -58,23 +62,27 @@ class TargetAnalysisService:
             raise ValueError("close contains invalid numbers")
 
         logger.info(
-            "Target analysis started: symbolToken=%s timeframe=%s sourceRowCount=%s horizons=%s thresholdsPct=%s",
+            "Target analysis started: symbolToken=%s tradingStyle=%s timeframe=%s sourceRowCount=%s horizons=%s thresholdsPct=%s",
             symbol_token,
+            trading_style.value,
             timeframe,
             source_row_count,
-            prediction_horizons,
+            prediction_horizons_bars,
             thresholds_pct,
         )
 
         analyses = []
-        for horizon in prediction_horizons:
+        for horizon in prediction_horizons_bars:
             if horizon >= source_row_count:
                 raise ValueError(
-                    f"Insufficient candles for prediction horizon {horizon}; "
-                    f"at least {horizon + 1} candles are required"
+                    f"Insufficient candles for prediction horizon {horizon}; at least {horizon + 1} candles are required"
                 )
 
-            labeled_df = self.label_generator.calculate_future_returns(source_df, horizon)
+            labeled_df = self.label_generator.calculate_future_returns(
+                source_df,
+                prediction_horizon_bars=horizon,
+                trading_style=trading_style,
+            )
             target_rows = labeled_df["future_close"].notna()
             invalid_returns = labeled_df.loc[target_rows, "future_return_pct"].replace(
                 [np.inf, -np.inf], np.nan
@@ -93,8 +101,9 @@ class TargetAnalysisService:
                 for threshold in thresholds_pct
             ]
             logger.info(
-                "Target analysis horizon: symbolToken=%s timeframe=%s horizon=%s validTargetRows=%s skippedRows=%s mean=%s std=%s",
+                "Target analysis horizon: symbolToken=%s tradingStyle=%s timeframe=%s horizon=%s validTargetRows=%s skippedRows=%s mean=%s std=%s",
                 symbol_token,
+                trading_style.value,
                 timeframe,
                 horizon,
                 valid_target_rows,
@@ -104,7 +113,7 @@ class TargetAnalysisService:
             )
             analyses.append(
                 HorizonAnalysis(
-                    predictionHorizon=horizon,
+                    predictionHorizonBars=horizon,
                     validTargetRows=valid_target_rows,
                     skippedRows=skipped_rows,
                     returnStatistics=statistics,
@@ -114,6 +123,7 @@ class TargetAnalysisService:
 
         return TargetAnalysisData(
             symbolToken=symbol_token,
+            tradingStyle=trading_style.value,
             timeframe=timeframe,
             sourceRowCount=source_row_count,
             analysis=analyses,

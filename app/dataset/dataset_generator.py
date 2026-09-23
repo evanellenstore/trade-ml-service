@@ -7,6 +7,9 @@ from datetime import datetime
 import pandas as pd
 
 from app.dataset.label_generator import LabelGenerator
+from app.dataset.target_policy import TargetPolicyFactory
+from app.domain.trading_style import TradingStyle
+from app.features.feature_config import FEATURE_VERSION
 from app.features.feature_engineering import FeatureEngineering
 from app.schemas.dataset_schema import DatasetSummary
 
@@ -41,13 +44,17 @@ class DatasetGenerator:
         self,
         symbol_token: str,
         timeframe: str,
-        prediction_horizon: int,
-        buy_threshold_pct: float,
-        sell_threshold_pct: float,
+        prediction_horizon_bars: int,
+        buy_threshold_pct: float = 0.5,
+        sell_threshold_pct: float = -0.5,
+        trading_style: TradingStyle | str = TradingStyle.INTRADAY,
         start_time: datetime | None = None,
         end_time: datetime | None = None,
     ) -> DatasetSummary:
         started_at = time.time()
+        normalized_style = TradingStyle.normalize(trading_style)
+        if prediction_horizon_bars <= 0:
+            raise ValueError("predictionHorizonBars must be greater than zero")
         if self.repository is None:
             from app.repository.market_data_repository import MarketDataRepository
 
@@ -62,12 +69,13 @@ class DatasetGenerator:
 
         labeled_df = self.label_generator.generate_labels(
             feature_df,
-            prediction_horizon=prediction_horizon,
+            prediction_horizon_bars=prediction_horizon_bars,
             buy_threshold_pct=buy_threshold_pct,
             sell_threshold_pct=sell_threshold_pct,
+            trading_style=normalized_style,
         )
 
-        cleaned_df = self._finalize_dataset(labeled_df, prediction_horizon)
+        cleaned_df = self._finalize_dataset(labeled_df)
 
         label_distribution = {
             "BUY": int((cleaned_df["label"] == "BUY").sum()),
@@ -77,20 +85,23 @@ class DatasetGenerator:
 
         summary = DatasetSummary(
             symbolToken=symbol_token,
+            tradingStyle=normalized_style.value,
             timeframe=timeframe,
-            predictionHorizon=prediction_horizon,
+            predictionHorizonBars=prediction_horizon_bars,
             sourceRowCount=int(len(source_df)),
             datasetRowCount=int(len(cleaned_df)),
             skippedRowCount=int(len(source_df) - len(cleaned_df)),
             featureCount=len(self.FEATURE_COLUMNS),
+            featureVersion=FEATURE_VERSION,
             labelDistribution=label_distribution,
         )
 
         logger.info(
-            "Dataset generation complete: symbolToken=%s timeframe=%s predictionHorizon=%s sourceRowCount=%s featureCount=%s warmupRowsRemoved=%s invalidRowsRemoved=%s finalDatasetCount=%s BUY=%s HOLD=%s SELL=%s executionTime=%.2fs",
+            "Dataset generation complete: symbolToken=%s tradingStyle=%s timeframe=%s predictionHorizonBars=%s sourceRowCount=%s featureCount=%s warmupRowsRemoved=%s invalidRowsRemoved=%s finalDatasetCount=%s BUY=%s HOLD=%s SELL=%s executionTime=%.2fs",
             symbol_token,
+            normalized_style.value,
             timeframe,
-            prediction_horizon,
+            prediction_horizon_bars,
             len(source_df),
             len(self.FEATURE_COLUMNS),
             int(len(source_df) - len(cleaned_df)),
@@ -120,7 +131,7 @@ class DatasetGenerator:
         df = df.sort_values(["symbol_token", "timeframe", "candle_time"]).reset_index(drop=True)
         return df
 
-    def _finalize_dataset(self, df: pd.DataFrame, prediction_horizon: int) -> pd.DataFrame:
+    def _finalize_dataset(self, df: pd.DataFrame) -> pd.DataFrame:
         required_columns = ["candle_id", "symbol_token", "timeframe", "candle_time", "close"]
         missing = [column for column in required_columns if column not in df.columns]
         if missing:
@@ -129,11 +140,9 @@ class DatasetGenerator:
         final_df = df.copy()
         final_df = final_df.dropna(subset=["close", "future_close", "future_return_pct"]).copy()
         final_df = final_df[final_df["future_close"].notna()].copy()
-
         final_df = final_df[final_df["future_return_pct"].notna()].copy()
         final_df = final_df[final_df["label"].notna()].copy()
 
-        final_df = final_df[~final_df["label"].isna()].copy()
         if final_df.empty:
             raise ValueError("Dataset is empty after filtering invalid rows")
 
@@ -141,8 +150,17 @@ class DatasetGenerator:
         if not feature_columns:
             raise ValueError("No valid feature columns found after engineering")
 
-        final_df = final_df[required_columns + feature_columns + ["future_close", "future_return_pct", "label"]].copy()
+        metadata_columns = {"candle_id", "symbol_token", "timeframe", "candle_time", "trading_date"}
+        final_columns = [
+            column for column in required_columns + feature_columns + ["future_close", "future_return_pct", "label"]
+            if column not in metadata_columns or column in final_df.columns
+        ]
+        final_df = final_df[final_columns].copy()
         return final_df.reset_index(drop=True)
+
+    @staticmethod
+    def resolve_target_policy(trading_style: TradingStyle | str):
+        return TargetPolicyFactory.create(trading_style)
 
 
 def np_all_finite(series: pd.Series) -> bool:

@@ -4,7 +4,9 @@ from datetime import datetime
 import math
 from typing import Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from app.domain.trading_style import TradingStyle
 
 
 VALID_TIMEFRAMES = {
@@ -20,14 +22,12 @@ VALID_TIMEFRAMES = {
 
 
 class TargetAnalysisRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
     symbolToken: str = Field(..., min_length=1)
+    tradingStyle: TradingStyle = Field(default=TradingStyle.INTRADAY)
     timeframe: str = Field(..., min_length=1)
-    predictionHorizons: list[int] = Field(
-        ...,
-        min_length=1,
-        max_length=20,
-        description="Positive bar horizons; for ONE_MINUTE, 15 means 15 bars ahead.",
-    )
+    predictionHorizonsBars: Optional[list[int]] = Field(default=None, min_length=1, max_length=20)
     thresholdsPct: list[float] = Field(
         ...,
         min_length=1,
@@ -37,6 +37,13 @@ class TargetAnalysisRequest(BaseModel):
     startTime: Optional[datetime] = None
     endTime: Optional[datetime] = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def require_horizons(cls, data):
+        if isinstance(data, dict) and "predictionHorizonsBars" not in data:
+            raise ValueError("predictionHorizonsBars is required")
+        return data
+
     @field_validator("timeframe")
     @classmethod
     def validate_timeframe(cls, value: str) -> str:
@@ -45,11 +52,11 @@ class TargetAnalysisRequest(BaseModel):
             raise ValueError(f"Unsupported timeframe: {value}")
         return normalized
 
-    @field_validator("predictionHorizons")
+    @field_validator("predictionHorizonsBars")
     @classmethod
     def validate_horizons(cls, values: list[int]) -> list[int]:
         if any(value <= 0 for value in values):
-            raise ValueError("predictionHorizons must contain only values greater than zero")
+            raise ValueError("predictionHorizonsBars must contain only values greater than zero")
         return sorted(set(values))
 
     @field_validator("thresholdsPct")
@@ -102,15 +109,15 @@ class ThresholdAnalysis(BaseModel):
 
 
 class HorizonAnalysis(BaseModel):
-    predictionHorizon: int
+    predictionHorizonBars: int
     validTargetRows: int
     skippedRows: int
     returnStatistics: DistributionStatistics
     thresholdAnalysis: list[ThresholdAnalysis]
 
-
 class TargetAnalysisData(BaseModel):
     symbolToken: str
+    tradingStyle: str
     timeframe: str
     sourceRowCount: int
     analysis: list[HorizonAnalysis]
