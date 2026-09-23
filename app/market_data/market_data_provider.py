@@ -50,58 +50,46 @@ class MarketDataProvider:
         self.indicator_calculator = indicator_calculator or IndicatorCalculator()
         self.indicator_warmup_bars = indicator_warmup_bars
 
-    def get_market_data(
-        self,
-        symbol_token: str,
-        timeframe: Timeframe | str,
-        start_time: datetime | None = None,
-        end_time: datetime | None = None,
+    def get_market_data(self,symbol_token: str,timeframe: Timeframe | str,start_time: datetime | None = None,end_time: datetime | None = None,
     ) -> MarketDataResult:
         normalized_timeframe = Timeframe.normalize(timeframe)
         repository = self._repository()
         if normalized_timeframe == Timeframe.ONE_MINUTE:
             data = repository.fetch_market_data(symbol_token, normalized_timeframe.value, start_time, end_time)
-            return MarketDataResult(
-                data=data,
-                diagnostics=MarketDataDiagnostics(
-                    source_timeframe=Timeframe.ONE_MINUTE.value,
-                    source_row_count=len(data),
-                    resampled_row_count=len(data),
-                    partial_candle_count=0,
-                    dropped_partial_candle_count=0,
-                    indicator_warmup_rows=0,
+            return MarketDataResult(data=data,diagnostics=MarketDataDiagnostics(source_timeframe=Timeframe.ONE_MINUTE.value,source_row_count=len(data),resampled_row_count=len(data),
+                    partial_candle_count=0,dropped_partial_candle_count=0,indicator_warmup_rows=0,
                 ),
             )
 
+        # Validate that the requested dynamic timeframe is enabled for resampling and indicator calculation.
         if normalized_timeframe not in self.ENABLED_DYNAMIC_TIMEFRAMES:
-            raise ValueError(
-                f"Dynamic timeframe support is not enabled for {normalized_timeframe.value}; "
-                "supported values: FIVE_MINUTE, FIFTEEN_MINUTE, THIRTY_MINUTE, "
-                "ONE_HOUR, ONE_DAY, ONE_WEEK"
-            )
+            raise ValueError(f"Dynamic timeframe support is not enabled for {normalized_timeframe.value}; " "supported values: FIVE_MINUTE, FIFTEEN_MINUTE, THIRTY_MINUTE, ""ONE_HOUR, ONE_DAY, ONE_WEEK")
 
+        # Determine the source timeframe and warmup lookback for the requested dynamic timeframe.
         definition = definition_for(normalized_timeframe)
         source_start = start_time
+        
         if source_start is not None:
             lookback_minutes = (definition.source_minutes or 1440) * self.indicator_warmup_bars
             source_start = source_start - timedelta(minutes=lookback_minutes)
+            
+        # Fetch raw one-minute candles, resample to the requested timeframe, and calculate indicators.   
         raw = repository.fetch_raw_candles(symbol_token, source_start, end_time)
+        
+        # Resample the raw one-minute candles to the requested dynamic timeframe, preserving partial candles if allowed.
         resampled = self.resampler.resample(raw, normalized_timeframe)
+        
+        # Calculate indicators on the resampled candles, and filter out warmup rows if requested.
         calculated = self.indicator_calculator.calculate(resampled.candles)
+        
+        # Determine the number of warmup rows to exclude from the final dataset based on the indicator warmup bars.
         warmup_rows = self.indicator_calculator.warmup_row_count(calculated)
         if start_time is not None:
             calculated = calculated.loc[calculated["candle_time"] >= pd.Timestamp(start_time)].copy()
         if end_time is not None:
             calculated = calculated.loc[calculated["candle_time"] <= pd.Timestamp(end_time)].copy()
-        return MarketDataResult(
-            data=calculated.reset_index(drop=True),
-            diagnostics=MarketDataDiagnostics(
-                source_timeframe=Timeframe.ONE_MINUTE.value,
-                source_row_count=len(raw),
-                resampled_row_count=resampled.diagnostics.resampled_row_count,
-                partial_candle_count=resampled.diagnostics.partial_candle_count,
-                dropped_partial_candle_count=resampled.diagnostics.dropped_partial_candle_count,
-                indicator_warmup_rows=warmup_rows,
+        return MarketDataResult(data=calculated.reset_index(drop=True),diagnostics=MarketDataDiagnostics(source_timeframe=Timeframe.ONE_MINUTE.value,source_row_count=len(raw),
+                resampled_row_count=resampled.diagnostics.resampled_row_count,partial_candle_count=resampled.diagnostics.partial_candle_count,dropped_partial_candle_count=resampled.diagnostics.dropped_partial_candle_count,indicator_warmup_rows=warmup_rows,
             ),
         )
 

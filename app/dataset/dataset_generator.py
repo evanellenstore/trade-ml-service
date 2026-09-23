@@ -42,24 +42,26 @@ class DatasetGenerator:
         self.feature_engineering = FeatureEngineering()
         self.label_generator = LabelGenerator()
 
-    def generate_dataset(
-        self,
-        symbol_token: str,
-        timeframe: str,
-        prediction_horizon_bars: int,
-        buy_threshold_pct: float = 0.5,
-        sell_threshold_pct: float = -0.5,
-        trading_style: TradingStyle | str = TradingStyle.INTRADAY,
-        start_time: datetime | None = None,
-        end_time: datetime | None = None,
-    ) -> DatasetSummary:
+    def generate_dataset(self,symbol_token: str,timeframe: str, prediction_horizon_bars: int,buy_threshold_pct: float = 0.5,
+        sell_threshold_pct: float = -0.5,trading_style: TradingStyle | str = TradingStyle.INTRADAY,
+        start_time: datetime | None = None,end_time: datetime | None = None,) -> DatasetSummary:
+        
+        """Generate a dataset using bars from the requested market timeframe.
+
+        ONE_MINUTE uses the existing database candle and indicator path.
+        Higher timeframes are prepared by MarketDataProvider from raw
+        one-minute candles. The prediction horizon always counts bars in the
+        requested timeframe, not minutes.
+        """
+        
         started_at = time.time()
         normalized_style = TradingStyle.normalize(trading_style)
         if prediction_horizon_bars <= 0:
             raise ValueError("predictionHorizonBars must be greater than zero")
-        market_data = self.market_data_provider.get_market_data(
-            symbol_token, timeframe, start_time, end_time
-        )
+
+        # The provider keeps ONE_MINUTE on the existing database-indicator path
+        # and prepares higher-timeframe candles and indicators in memory.
+        market_data = self.market_data_provider.get_market_data(symbol_token, timeframe, start_time, end_time)
         source_df = market_data.data
 
         if source_df.empty:
@@ -68,14 +70,13 @@ class DatasetGenerator:
         source_df = self._validate_and_order(source_df)
         feature_df = self.feature_engineering.transform(source_df)
 
-        labeled_df = self.label_generator.generate_labels(
-            feature_df,
-            prediction_horizon_bars=prediction_horizon_bars,
-            buy_threshold_pct=buy_threshold_pct,
-            sell_threshold_pct=sell_threshold_pct,
-            trading_style=normalized_style,
-        )
+        # Calculate targets before filtering feature warm-up rows so the
+        # horizon always refers to actual market bars in the requested timeframe.
 
+        labeled_df = self.label_generator.generate_labels(feature_df,prediction_horizon_bars=prediction_horizon_bars,buy_threshold_pct=buy_threshold_pct,sell_threshold_pct=sell_threshold_pct,trading_style=normalized_style)
+
+        # Filter out rows with incomplete features or invalid targets. The final
+        # dataset is guaranteed to have all declared v1 features and valid labels.
         cleaned_df, filtering_diagnostics = self._finalize_dataset(labeled_df)
 
         label_distribution = {
@@ -84,40 +85,15 @@ class DatasetGenerator:
             "SELL": int((cleaned_df["label"] == "SELL").sum()),
         }
 
-        summary = DatasetSummary(
-            symbolToken=symbol_token,
-            tradingStyle=normalized_style.value,
-            timeframe=timeframe,
-            predictionHorizonBars=prediction_horizon_bars,
+        summary = DatasetSummary(symbolToken=symbol_token,tradingStyle=normalized_style.value,timeframe=timeframe,predictionHorizonBars=prediction_horizon_bars,
             sourceTimeframe=market_data.diagnostics.source_timeframe,
-            sourceRowCount=int(market_data.diagnostics.source_row_count),
-            resampledRowCount=market_data.diagnostics.resampled_row_count,
-            partialCandleCount=market_data.diagnostics.partial_candle_count,
+            sourceRowCount=int(market_data.diagnostics.source_row_count),resampledRowCount=market_data.diagnostics.resampled_row_count,partialCandleCount=market_data.diagnostics.partial_candle_count,
             droppedPartialCandleCount=market_data.diagnostics.dropped_partial_candle_count,
-            indicatorWarmupRows=filtering_diagnostics["indicator_warmup_rows"],
-            datasetRowCount=int(len(cleaned_df)),
-            skippedRowCount=filtering_diagnostics["target_skipped_rows"],
-            featureCount=len(self.FEATURE_COLUMNS),
-            featureVersion=FEATURE_VERSION,
-            labelDistribution=label_distribution,
+            indicatorWarmupRows=filtering_diagnostics["indicator_warmup_rows"],datasetRowCount=int(len(cleaned_df)),skippedRowCount=filtering_diagnostics["target_skipped_rows"],
+            featureCount=len(self.FEATURE_COLUMNS),featureVersion=FEATURE_VERSION,labelDistribution=label_distribution,
         )
 
-        logger.info(
-            "Dataset generation complete: symbolToken=%s tradingStyle=%s timeframe=%s predictionHorizonBars=%s sourceRowCount=%s featureCount=%s warmupRowsRemoved=%s invalidRowsRemoved=%s finalDatasetCount=%s BUY=%s HOLD=%s SELL=%s executionTime=%.2fs",
-            symbol_token,
-            normalized_style.value,
-            timeframe,
-            prediction_horizon_bars,
-            len(source_df),
-            len(self.FEATURE_COLUMNS),
-            filtering_diagnostics["feature_invalid_rows"],
-            filtering_diagnostics["target_skipped_rows"],
-            len(cleaned_df),
-            label_distribution["BUY"],
-            label_distribution["HOLD"],
-            label_distribution["SELL"],
-            time.time() - started_at,
-        )
+        logger.info("Dataset generation complete: symbolToken=%s tradingStyle=%s timeframe=%s predictionHorizonBars=%s sourceRowCount=%s featureCount=%s warmupRowsRemoved=%s invalidRowsRemoved=%s finalDatasetCount=%s BUY=%s HOLD=%s SELL=%s executionTime=%.2fs",symbol_token,normalized_style.value,timeframe,prediction_horizon_bars,len(source_df),len(self.FEATURE_COLUMNS),filtering_diagnostics["feature_invalid_rows"],filtering_diagnostics["target_skipped_rows"],len(cleaned_df),label_distribution["BUY"],label_distribution["HOLD"],label_distribution["SELL"],time.time() - started_at)
         return summary
 
     def _validate_and_order(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -138,6 +114,13 @@ class DatasetGenerator:
         return df
 
     def _finalize_dataset(self, df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
+        """Select rows with both complete v1 features and valid targets.
+
+        Target columns are created before this method so removing feature
+        warm-up rows cannot change bar-distance semantics. Final rows are
+        selected with ``feature_ready AND target_valid``; metadata and unused
+        indicator columns do not decide feature readiness.
+        """
         required_columns = ["candle_id", "symbol_token", "timeframe", "candle_time", "close"]
         missing = [column for column in required_columns if column not in df.columns]
         if missing:
@@ -148,6 +131,8 @@ class DatasetGenerator:
         if missing_features:
             raise ValueError(f"Dataset missing required feature columns: {missing_features}")
 
+        # Readiness is based only on the declared v1 model inputs. Auxiliary
+        # indicator or metadata columns must not remove otherwise valid rows.
         feature_ready_mask = self._finite_columns_mask(df, feature_columns)
         indicator_feature_columns = [
             column
@@ -159,6 +144,8 @@ class DatasetGenerator:
             if indicator_feature_columns
             else pd.Series(False, index=df.index)
         )
+        # Target validity is independent from feature readiness; both masks
+        # must be true before a row can enter the training dataset.
         target_valid_mask = self._finite_columns_mask(
             df,
             ["close", "future_close", "future_return_pct", "label"],
@@ -182,6 +169,8 @@ class DatasetGenerator:
             raise ValueError("Dataset contains invalid feature values")
         if final_df["label"].isna().any():
             raise ValueError("Dataset contains null labels")
+        # Keep overlapping exclusions visible for diagnostics instead of
+        # deriving dataset size by subtracting independent counts.
         diagnostics = {
             "indicator_warmup_rows": int(indicator_warmup_mask.sum()),
             "feature_invalid_rows": int((~feature_ready_mask).sum()),
