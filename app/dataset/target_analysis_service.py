@@ -10,6 +10,7 @@ import pandas as pd
 
 from app.dataset.label_generator import LabelGenerator
 from app.domain.trading_style import TradingStyle
+from app.market_data.market_data_provider import MarketDataProvider
 from app.schemas.target_analysis_schema import (
     ClassMetric,
     DistributionStatistics,
@@ -30,7 +31,7 @@ class TargetAnalysisService:
             from app.repository.market_data_repository import MarketDataRepository
 
             repository = MarketDataRepository()
-        self.repository = repository
+        self.market_data_provider = MarketDataProvider(repository=repository)
         self.label_generator = LabelGenerator()
 
     def analyze(
@@ -52,7 +53,9 @@ class TargetAnalysisService:
         thresholds_pct = sorted(set(thresholds_pct))
         trading_style = TradingStyle.normalize(trading_style)
 
-        source_df = self.repository.fetch_market_data(symbol_token, timeframe, start_time, end_time)
+        source_df = self.market_data_provider.get_market_data(
+            symbol_token, timeframe, start_time, end_time
+        ).data
         source_row_count = len(source_df)
         if source_row_count == 0:
             raise ValueError("No market data found for the requested symbol and timeframe")

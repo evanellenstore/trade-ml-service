@@ -7,18 +7,7 @@ from typing import Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.domain.trading_style import TradingStyle
-
-
-VALID_TIMEFRAMES = {
-    "ONE_MINUTE",
-    "THREE_MINUTE",
-    "FIVE_MINUTE",
-    "FIFTEEN_MINUTE",
-    "THIRTY_MINUTE",
-    "ONE_HOUR",
-    "FOUR_HOUR",
-    "ONE_DAY",
-}
+from app.market_data.timeframe import Timeframe
 
 
 class TargetAnalysisRequest(BaseModel):
@@ -47,10 +36,7 @@ class TargetAnalysisRequest(BaseModel):
     @field_validator("timeframe")
     @classmethod
     def validate_timeframe(cls, value: str) -> str:
-        normalized = value.upper()
-        if normalized not in VALID_TIMEFRAMES:
-            raise ValueError(f"Unsupported timeframe: {value}")
-        return normalized
+        return Timeframe.normalize(value).value
 
     @field_validator("predictionHorizonsBars")
     @classmethod

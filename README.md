@@ -175,6 +175,27 @@ Open Swagger / OpenAPI at:
 pytest -q
 ```
 
+## Timeframe data
+
+`ONE_MINUTE` remains the canonical database timeframe and continues to use the
+existing candle-to-indicator join. `FIVE_MINUTE`, `FIFTEEN_MINUTE`,
+`THIRTY_MINUTE`, `ONE_HOUR`, `ONE_DAY`, and `ONE_WEEK` are generated in memory
+from raw one-minute OHLCV candles, with session-aware aggregation and strict
+partial-candle removal by default.
+
+Example five-minute dataset request:
+
+```json
+{
+        "symbolToken": "14154",
+        "tradingStyle": "INTRADAY",
+        "timeframe": "FIVE_MINUTE",
+        "predictionHorizonBars": 6,
+        "buyThresholdPct": 0.15,
+        "sellThresholdPct": -0.15
+}
+```
+
 ## Docker
 
 ```bash

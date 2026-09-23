@@ -6,6 +6,7 @@ from typing import Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.domain.trading_style import TradingStyle
+from app.market_data.timeframe import Timeframe
 
 
 class DatasetRequest(BaseModel):
@@ -30,19 +31,7 @@ class DatasetRequest(BaseModel):
     @field_validator("timeframe")
     @classmethod
     def validate_timeframe(cls, value: str) -> str:
-        valid = {
-            "ONE_MINUTE",
-            "THREE_MINUTE",
-            "FIVE_MINUTE",
-            "FIFTEEN_MINUTE",
-            "THIRTY_MINUTE",
-            "ONE_HOUR",
-            "FOUR_HOUR",
-            "ONE_DAY",
-        }
-        if value.upper() not in valid:
-            raise ValueError(f"Unsupported timeframe: {value}")
-        return value.upper()
+        return Timeframe.normalize(value).value
 
     @field_validator("buyThresholdPct")
     @classmethod
@@ -66,7 +55,12 @@ class DatasetSummary(BaseModel):
     tradingStyle: str
     timeframe: str
     predictionHorizonBars: int
+    sourceTimeframe: str = "ONE_MINUTE"
     sourceRowCount: int
+    resampledRowCount: int = 0
+    partialCandleCount: int = 0
+    droppedPartialCandleCount: int = 0
+    indicatorWarmupRows: int = 0
     datasetRowCount: int
     skippedRowCount: int
     featureCount: int

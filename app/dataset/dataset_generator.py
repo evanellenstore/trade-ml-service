@@ -11,6 +11,8 @@ from app.dataset.target_policy import TargetPolicyFactory
 from app.domain.trading_style import TradingStyle
 from app.features.feature_config import FEATURE_VERSION
 from app.features.feature_engineering import FeatureEngineering
+from app.indicators.indicator_calculator import IndicatorCalculator
+from app.market_data.market_data_provider import MarketDataProvider
 from app.schemas.dataset_schema import DatasetSummary
 
 logger = logging.getLogger(__name__)
@@ -36,7 +38,7 @@ class DatasetGenerator:
     ]
 
     def __init__(self) -> None:
-        self.repository = None
+        self.market_data_provider = MarketDataProvider()
         self.feature_engineering = FeatureEngineering()
         self.label_generator = LabelGenerator()
 
@@ -55,11 +57,10 @@ class DatasetGenerator:
         normalized_style = TradingStyle.normalize(trading_style)
         if prediction_horizon_bars <= 0:
             raise ValueError("predictionHorizonBars must be greater than zero")
-        if self.repository is None:
-            from app.repository.market_data_repository import MarketDataRepository
-
-            self.repository = MarketDataRepository()
-        source_df = self.repository.fetch_market_data(symbol_token, timeframe, start_time, end_time)
+        market_data = self.market_data_provider.get_market_data(
+            symbol_token, timeframe, start_time, end_time
+        )
+        source_df = market_data.data
 
         if source_df.empty:
             raise ValueError("No market data found for the requested symbol and timeframe")
@@ -75,7 +76,7 @@ class DatasetGenerator:
             trading_style=normalized_style,
         )
 
-        cleaned_df = self._finalize_dataset(labeled_df)
+        cleaned_df, filtering_diagnostics = self._finalize_dataset(labeled_df)
 
         label_distribution = {
             "BUY": int((cleaned_df["label"] == "BUY").sum()),
@@ -88,9 +89,14 @@ class DatasetGenerator:
             tradingStyle=normalized_style.value,
             timeframe=timeframe,
             predictionHorizonBars=prediction_horizon_bars,
-            sourceRowCount=int(len(source_df)),
+            sourceTimeframe=market_data.diagnostics.source_timeframe,
+            sourceRowCount=int(market_data.diagnostics.source_row_count),
+            resampledRowCount=market_data.diagnostics.resampled_row_count,
+            partialCandleCount=market_data.diagnostics.partial_candle_count,
+            droppedPartialCandleCount=market_data.diagnostics.dropped_partial_candle_count,
+            indicatorWarmupRows=filtering_diagnostics["indicator_warmup_rows"],
             datasetRowCount=int(len(cleaned_df)),
-            skippedRowCount=int(len(source_df) - len(cleaned_df)),
+            skippedRowCount=filtering_diagnostics["target_skipped_rows"],
             featureCount=len(self.FEATURE_COLUMNS),
             featureVersion=FEATURE_VERSION,
             labelDistribution=label_distribution,
@@ -104,8 +110,8 @@ class DatasetGenerator:
             prediction_horizon_bars,
             len(source_df),
             len(self.FEATURE_COLUMNS),
-            int(len(source_df) - len(cleaned_df)),
-            0,
+            filtering_diagnostics["feature_invalid_rows"],
+            filtering_diagnostics["target_skipped_rows"],
             len(cleaned_df),
             label_distribution["BUY"],
             label_distribution["HOLD"],
@@ -131,24 +137,37 @@ class DatasetGenerator:
         df = df.sort_values(["symbol_token", "timeframe", "candle_time"]).reset_index(drop=True)
         return df
 
-    def _finalize_dataset(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _finalize_dataset(self, df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
         required_columns = ["candle_id", "symbol_token", "timeframe", "candle_time", "close"]
         missing = [column for column in required_columns if column not in df.columns]
         if missing:
             raise ValueError(f"Dataset missing required columns: {missing}")
 
-        final_df = df.copy()
-        final_df = final_df.dropna(subset=["close", "future_close", "future_return_pct"]).copy()
-        final_df = final_df[final_df["future_close"].notna()].copy()
-        final_df = final_df[final_df["future_return_pct"].notna()].copy()
-        final_df = final_df[final_df["label"].notna()].copy()
+        feature_columns = list(self.FEATURE_COLUMNS)
+        missing_features = [column for column in feature_columns if column not in df.columns]
+        if missing_features:
+            raise ValueError(f"Dataset missing required feature columns: {missing_features}")
+
+        feature_ready_mask = self._finite_columns_mask(df, feature_columns)
+        indicator_feature_columns = [
+            column
+            for column in feature_columns
+            if column in IndicatorCalculator.INDICATOR_COLUMNS
+        ]
+        indicator_warmup_mask = (
+            ~self._finite_columns_mask(df, indicator_feature_columns)
+            if indicator_feature_columns
+            else pd.Series(False, index=df.index)
+        )
+        target_valid_mask = self._finite_columns_mask(
+            df,
+            ["close", "future_close", "future_return_pct", "label"],
+        )
+        final_valid_mask = feature_ready_mask & target_valid_mask
+        final_df = df.loc[final_valid_mask].copy()
 
         if final_df.empty:
             raise ValueError("Dataset is empty after filtering invalid rows")
-
-        feature_columns = [column for column in self.FEATURE_COLUMNS if column in final_df.columns]
-        if not feature_columns:
-            raise ValueError("No valid feature columns found after engineering")
 
         metadata_columns = {"candle_id", "symbol_token", "timeframe", "candle_time", "trading_date"}
         final_columns = [
@@ -156,7 +175,33 @@ class DatasetGenerator:
             if column not in metadata_columns or column in final_df.columns
         ]
         final_df = final_df[final_columns].copy()
-        return final_df.reset_index(drop=True)
+        feature_matrix = final_df[feature_columns]
+        if not feature_matrix.apply(pd.api.types.is_numeric_dtype).all():
+            raise ValueError("Dataset contains non-numeric feature columns")
+        if not feature_matrix.replace([float("inf"), float("-inf")], float("nan")).notna().all().all():
+            raise ValueError("Dataset contains invalid feature values")
+        if final_df["label"].isna().any():
+            raise ValueError("Dataset contains null labels")
+        diagnostics = {
+            "indicator_warmup_rows": int(indicator_warmup_mask.sum()),
+            "feature_invalid_rows": int((~feature_ready_mask).sum()),
+            "target_skipped_rows": int((~target_valid_mask).sum()),
+            "overlap_warmup_and_target_skipped_rows": int(
+                ((~feature_ready_mask) & (~target_valid_mask)).sum()
+            ),
+        }
+        return final_df.reset_index(drop=True), diagnostics
+
+    @staticmethod
+    def _finite_columns_mask(df: pd.DataFrame, columns: list[str]) -> pd.Series:
+        values = df[columns].notna().all(axis=1)
+        for column in columns:
+            if pd.api.types.is_numeric_dtype(df[column]):
+                values &= pd.Series(
+                    df[column].replace([float("inf"), float("-inf")], float("nan")),
+                    index=df.index,
+                ).notna()
+        return values
 
     @staticmethod
     def resolve_target_policy(trading_style: TradingStyle | str):
