@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import time
 from datetime import datetime
 
@@ -72,7 +73,11 @@ class DatasetGenerator:
             "HOLD": int((cleaned_df["label"] == "HOLD").sum()),
             "SELL": int((cleaned_df["label"] == "SELL").sum()),
         }
-        skip_reasons = self._primary_skip_reasons(labeled_df)
+        skip_reasons = self._primary_skip_reasons(
+            labeled_df,
+            prediction_horizon_bars=prediction_horizon_bars,
+            trading_style=normalized_style,
+        )
         feature_schema = self.FEATURE_SCHEMA.as_dict()
         dataset_start_time = cleaned_df["candle_time"].min().isoformat() if not cleaned_df.empty else None
         dataset_end_time = cleaned_df["candle_time"].max().isoformat() if not cleaned_df.empty else None
@@ -89,9 +94,16 @@ class DatasetGenerator:
             dataset_end_time=dataset_end_time,
             dataset_row_count=int(len(cleaned_df)),
         )
+        feature_validation = self._feature_validation_audit(
+            labeled_df,
+            cleaned_df,
+            filtering_diagnostics,
+        )
         training_eligibility = self._training_eligibility(
             dataset_row_count=int(len(cleaned_df)),
             feature_count=len(self.FEATURE_COLUMNS),
+            feature_validation=feature_validation,
+            label_distribution=label_distribution,
             skip_reasons=skip_reasons,
         )
 
@@ -114,6 +126,7 @@ class DatasetGenerator:
             featureSchema=feature_schema,
             skipReasons=skip_reasons,
             trainingEligibility=training_eligibility,
+            featureValidation=feature_validation,
             datasetFingerprint=dataset_fingerprint,
         )
 
@@ -212,28 +225,92 @@ class DatasetGenerator:
         result.loc[result["future_return_pct"] <= sell_threshold_pct, "label"] = "SELL"
         return result
 
-    def _primary_skip_reasons(self, df: pd.DataFrame) -> dict[str, int]:
-        reasons: dict[str, int] = {}
-        if "future_close" in df.columns:
-            insufficient = df["future_close"].isna() | df["future_return_pct"].isna()
-            reasons["insufficientFutureBars"] = int(insufficient.sum())
-        feature_columns = list(self.FEATURE_COLUMNS)
-        invalid_features = self._feature_validation(df)
-        reasons["invalidFeature"] = int(invalid_features["rowsWithInvalidFeatures"])
-        return reasons
+    def _primary_skip_reasons(
+        self,
+        df: pd.DataFrame,
+        prediction_horizon_bars: int,
+        trading_style: TradingStyle | str = TradingStyle.INTRADAY,
+    ) -> dict[str, int]:
+        target_invalid = (
+            df["future_close"].isna() | df["future_return_pct"].isna()
+            if "future_close" in df.columns and "future_return_pct" in df.columns
+            else pd.Series(False, index=df.index)
+        )
+        if not target_invalid.any():
+            return {}
+
+        normalized_style = TradingStyle.normalize(trading_style)
+        group_columns = ["symbol_token", "timeframe"]
+        if normalized_style == TradingStyle.INTRADAY and "trading_date" in df.columns:
+            group_columns.append("trading_date")
+        group_sizes = df.groupby(group_columns, dropna=False).size()
+        insufficient_rows = pd.Series(False, index=df.index)
+        if set(group_columns).issubset(df.columns):
+            session_sizes = df.groupby(group_columns, dropna=False).transform("size")
+            insufficient_rows = target_invalid & (session_sizes < prediction_horizon_bars)
+        cross_session_rows = target_invalid & ~insufficient_rows
+        return {
+            "crossSessionHorizon": int(cross_session_rows.sum()),
+            "insufficientFutureBars": int(insufficient_rows.sum()),
+        }
 
     def _feature_validation(self, df: pd.DataFrame) -> dict[str, int]:
         feature_columns = list(self.FEATURE_COLUMNS)
         if not feature_columns:
-            return {"positiveInfinityCount": 0, "rowsWithInvalidFeatures": 0}
+            return {
+                "rowsWithInvalidFeatures": 0,
+                "nullValueCount": 0,
+                "nanValueCount": 0,
+                "positiveInfinityCount": 0,
+                "negativeInfinityCount": 0,
+            }
         available = [column for column in feature_columns if column in df.columns]
         values = df[available]
-        invalid_values = values.replace([float("inf"), float("-inf")], float("nan"))
-        positive_infinity_count = int(((values == float("inf")) | (values == float("-inf"))).sum().sum())
-        invalid_rows = invalid_values.isna().any(axis=1)
+        null_value_count = int(
+            values.apply(
+                lambda column: column.map(
+                    lambda value: value is None or value is pd.NA
+                )
+            ).sum().sum()
+        )
+        nan_value_count = int(
+            values.apply(
+                lambda column: column.map(
+                    lambda value: isinstance(value, float) and math.isnan(value)
+                )
+            ).sum().sum()
+        )
+        positive_infinity_count = int((values == float("inf")).sum().sum())
+        negative_infinity_count = int((values == float("-inf")).sum().sum())
+        invalid_rows = (
+            values.isna().any(axis=1)
+            | (values.eq(float("inf")) | values.eq(float("-inf"))).any(axis=1)
+        )
         return {
-            "positiveInfinityCount": positive_infinity_count,
             "rowsWithInvalidFeatures": int(invalid_rows.sum()),
+            "nullValueCount": null_value_count,
+            "nanValueCount": nan_value_count,
+            "positiveInfinityCount": positive_infinity_count,
+            "negativeInfinityCount": negative_infinity_count,
+        }
+
+    def _feature_validation_audit(
+        self,
+        source_df: pd.DataFrame,
+        final_df: pd.DataFrame,
+        diagnostics: dict[str, int],
+    ) -> dict[str, object]:
+        before = self._feature_validation(source_df)
+        after = self._feature_validation(final_df)
+        feature_warmup_rows = 0
+        if all(column in source_df.columns for column in ["volume", "relative_volume", "rolling_volume_mean"]):
+            feature_warmup_rows = int(
+                source_df["relative_volume"].isna().mul(source_df["volume"].eq(0)).sum()
+            )
+        return {
+            "beforeFiltering": before,
+            "afterFiltering": after,
+            "featureWarmupRows": feature_warmup_rows,
         }
 
     @staticmethod
@@ -270,13 +347,19 @@ class DatasetGenerator:
     def _training_eligibility(
         dataset_row_count: int,
         feature_count: int,
+        feature_validation: dict[str, object],
+        label_distribution: dict[str, int],
         skip_reasons: dict[str, int],
     ) -> dict[str, object]:
         reasons = []
         if dataset_row_count == 0:
-            reasons.append("INSUFFICIENT_SAMPLES")
+            reasons.append("EMPTY_DATASET")
         if feature_count == 0:
             reasons.append("NO_FEATURES")
+        if feature_validation["afterFiltering"]["rowsWithInvalidFeatures"] > 0:
+            reasons.append("INVALID_FINAL_FEATURES")
+        if sum(label_distribution.values()) != dataset_row_count:
+            reasons.append("LABEL_COUNT_MISMATCH")
         if skip_reasons.get("insufficientFutureBars", 0) > 0:
             reasons.append("INSUFFICIENT_FUTURE_BARS")
         return {"eligible": not reasons, "reasons": reasons}

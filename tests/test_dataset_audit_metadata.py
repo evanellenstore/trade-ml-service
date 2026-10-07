@@ -100,17 +100,20 @@ def test_primary_skip_reasons_reconcile_with_skipped_row_count():
     generator = DatasetGenerator()
     frame = pd.DataFrame(
         {
-            "future_close": [101.0, None, 102.0],
-            "future_return_pct": [1.0, None, 2.0],
-            "label": ["BUY", None, "BUY"],
-            "return_1": [1.0, float("nan"), 1.0],
+            "symbol_token": ["A"] * 4,
+            "timeframe": ["ONE_MINUTE"] * 4,
+            "trading_date": pd.to_datetime(["2026-01-01"] * 4).date,
+            "future_close": [101.0, 102.0, None, None],
+            "future_return_pct": [1.0, 2.0, None, None],
+            "label": ["BUY", "HOLD", "BUY", "SELL"],
+            "return_1": [1.0, float("nan"), 1.0, 1.0],
         }
     )
 
-    reasons = generator._primary_skip_reasons(frame)
+    reasons = generator._primary_skip_reasons(frame, prediction_horizon_bars=2)
     assert reasons == {
-        "insufficientFutureBars": 1,
-        "invalidFeature": 1,
+        "crossSessionHorizon": 2,
+        "insufficientFutureBars": 0,
     }
     assert sum(reasons.values()) == 2
 
@@ -135,6 +138,8 @@ def test_invalid_feature_values_are_reported_without_replacement():
 
     validation = generator._feature_validation(frame)
     assert validation["positiveInfinityCount"] == 1
+    assert validation["negativeInfinityCount"] == 0
+    assert validation["nanValueCount"] == 0
     assert validation["rowsWithInvalidFeatures"] == 1
 
 
@@ -151,9 +156,28 @@ def test_summary_model_accepts_new_audit_fields():
         featureVersion="v1",
         labelDistribution={"BUY": 1, "HOLD": 0, "SELL": 0},
         featureSchema={"version": "v1", "count": 15, "features": ["return_1"]},
-        skipReasons={"insufficientFutureBars": 1},
-        trainingEligibility={"eligible": False, "reasons": ["INSUFFICIENT_SAMPLES"]},
+        skipReasons={"crossSessionHorizon": 1},
+        trainingEligibility={"eligible": True, "reasons": []},
+        featureValidation={
+            "beforeFiltering": {
+                "rowsWithInvalidFeatures": 1,
+                "nullValueCount": 0,
+                "nanValueCount": 1,
+                "positiveInfinityCount": 0,
+                "negativeInfinityCount": 0,
+            },
+            "afterFiltering": {
+                "rowsWithInvalidFeatures": 0,
+                "nullValueCount": 0,
+                "nanValueCount": 0,
+                "positiveInfinityCount": 0,
+                "negativeInfinityCount": 0,
+            },
+            "featureWarmupRows": 1,
+        },
     )
 
     assert summary.featureSchema.count == 15
-    assert summary.trainingEligibility.reasons == ["INSUFFICIENT_SAMPLES"]
+    assert summary.trainingEligibility.eligible is True
+    assert summary.trainingEligibility.reasons == []
+    assert summary.featureValidation.featureWarmupRows == 1

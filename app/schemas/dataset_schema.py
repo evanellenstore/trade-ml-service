@@ -59,6 +59,20 @@ class TrainingEligibility(BaseModel):
     reasons: list[str]
 
 
+class FeatureValidationSummary(BaseModel):
+    rowsWithInvalidFeatures: int = 0
+    nullValueCount: int = 0
+    nanValueCount: int = 0
+    positiveInfinityCount: int = 0
+    negativeInfinityCount: int = 0
+
+
+class FeatureValidationAudit(BaseModel):
+    beforeFiltering: FeatureValidationSummary
+    afterFiltering: FeatureValidationSummary
+    featureWarmupRows: int = 0
+
+
 class DatasetSummary(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -80,6 +94,7 @@ class DatasetSummary(BaseModel):
     featureSchema: Optional[FeatureSchemaSummary] = None
     skipReasons: Optional[dict[str, int]] = None
     trainingEligibility: Optional[TrainingEligibility] = None
+    featureValidation: Optional[FeatureValidationAudit] = None
     datasetFingerprint: Optional[str] = None
 
 
