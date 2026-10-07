@@ -48,6 +48,17 @@ class DatasetRequest(BaseModel):
         return value
 
 
+class FeatureSchemaSummary(BaseModel):
+    version: str
+    count: int
+    features: list[str]
+
+
+class TrainingEligibility(BaseModel):
+    eligible: bool
+    reasons: list[str]
+
+
 class DatasetSummary(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -66,6 +77,11 @@ class DatasetSummary(BaseModel):
     featureCount: int
     featureVersion: str = "v1"
     labelDistribution: dict[str, int]
+    featureSchema: Optional[FeatureSchemaSummary] = None
+    skipReasons: Optional[dict[str, int]] = None
+    trainingEligibility: Optional[TrainingEligibility] = None
+    datasetFingerprint: Optional[str] = None
+
 
 class DatasetGenerationResponse(BaseModel):
     success: bool

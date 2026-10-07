@@ -5,6 +5,7 @@ from typing import ClassVar
 
 import pandas as pd
 
+from app.dataset.target_metadata import TargetPolicyResolver
 from app.domain.trading_style import TradingStyle
 
 
@@ -51,6 +52,10 @@ class TargetPolicy(ABC):
 
 class TargetPolicyFactory:
     _policies: dict[TradingStyle, TargetPolicy] = {}
+
+    @classmethod
+    def metadata_for(cls, trading_style: TradingStyle | str):
+        return TargetPolicyResolver.metadata_for(trading_style)
 
     @classmethod
     def create(cls, trading_style: TradingStyle | str) -> TargetPolicy:

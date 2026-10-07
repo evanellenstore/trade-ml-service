@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import time
 from datetime import datetime
@@ -11,6 +13,7 @@ from app.dataset.target_policy import TargetPolicyFactory
 from app.domain.trading_style import TradingStyle
 from app.features.feature_config import FEATURE_VERSION
 from app.features.feature_engineering import FeatureEngineering
+from app.features.feature_schema import FEATURE_SCHEMA
 from app.indicators.indicator_calculator import IndicatorCalculator
 from app.market_data.market_data_provider import MarketDataProvider
 from app.schemas.dataset_schema import DatasetSummary
@@ -19,23 +22,8 @@ logger = logging.getLogger(__name__)
 
 
 class DatasetGenerator:
-    FEATURE_COLUMNS = [
-        "return_1",
-        "return_5",
-        "return_15",
-        "price_range_pct",
-        "body_size_pct",
-        "upper_wick_pct",
-        "lower_wick_pct",
-        "volume_change_pct",
-        "rolling_volume_mean",
-        "relative_volume",
-        "is_doji",
-        "is_hammer",
-        "is_shooting_star",
-        "is_bullish_engulfing",
-        "is_bearish_engulfing",
-    ]
+    FEATURE_SCHEMA = FEATURE_SCHEMA
+    FEATURE_COLUMNS = list(FEATURE_SCHEMA.columns)
 
     def __init__(self) -> None:
         self.market_data_provider = MarketDataProvider()
@@ -84,13 +72,49 @@ class DatasetGenerator:
             "HOLD": int((cleaned_df["label"] == "HOLD").sum()),
             "SELL": int((cleaned_df["label"] == "SELL").sum()),
         }
+        skip_reasons = self._primary_skip_reasons(labeled_df)
+        feature_schema = self.FEATURE_SCHEMA.as_dict()
+        dataset_start_time = cleaned_df["candle_time"].min().isoformat() if not cleaned_df.empty else None
+        dataset_end_time = cleaned_df["candle_time"].max().isoformat() if not cleaned_df.empty else None
+        dataset_fingerprint = self._dataset_fingerprint(
+            symbol_token=symbol_token,
+            trading_style=normalized_style,
+            timeframe=timeframe,
+            prediction_horizon_bars=prediction_horizon_bars,
+            buy_threshold_pct=buy_threshold_pct,
+            sell_threshold_pct=sell_threshold_pct,
+            feature_version=FEATURE_VERSION,
+            feature_columns=list(self.FEATURE_COLUMNS),
+            dataset_start_time=dataset_start_time,
+            dataset_end_time=dataset_end_time,
+            dataset_row_count=int(len(cleaned_df)),
+        )
+        training_eligibility = self._training_eligibility(
+            dataset_row_count=int(len(cleaned_df)),
+            feature_count=len(self.FEATURE_COLUMNS),
+            skip_reasons=skip_reasons,
+        )
 
-        summary = DatasetSummary(symbolToken=symbol_token,tradingStyle=normalized_style.value,timeframe=timeframe,predictionHorizonBars=prediction_horizon_bars,
+        summary = DatasetSummary(
+            symbolToken=symbol_token,
+            tradingStyle=normalized_style.value,
+            timeframe=timeframe,
+            predictionHorizonBars=prediction_horizon_bars,
             sourceTimeframe=market_data.diagnostics.source_timeframe,
-            sourceRowCount=int(market_data.diagnostics.source_row_count),resampledRowCount=market_data.diagnostics.resampled_row_count,partialCandleCount=market_data.diagnostics.partial_candle_count,
+            sourceRowCount=int(market_data.diagnostics.source_row_count),
+            resampledRowCount=market_data.diagnostics.resampled_row_count,
+            partialCandleCount=market_data.diagnostics.partial_candle_count,
             droppedPartialCandleCount=market_data.diagnostics.dropped_partial_candle_count,
-            indicatorWarmupRows=filtering_diagnostics["indicator_warmup_rows"],datasetRowCount=int(len(cleaned_df)),skippedRowCount=filtering_diagnostics["target_skipped_rows"],
-            featureCount=len(self.FEATURE_COLUMNS),featureVersion=FEATURE_VERSION,labelDistribution=label_distribution,
+            indicatorWarmupRows=filtering_diagnostics["indicator_warmup_rows"],
+            datasetRowCount=int(len(cleaned_df)),
+            skippedRowCount=filtering_diagnostics["target_skipped_rows"],
+            featureCount=len(self.FEATURE_COLUMNS),
+            featureVersion=FEATURE_VERSION,
+            labelDistribution=label_distribution,
+            featureSchema=feature_schema,
+            skipReasons=skip_reasons,
+            trainingEligibility=training_eligibility,
+            datasetFingerprint=dataset_fingerprint,
         )
 
         logger.info("Dataset generation complete: symbolToken=%s tradingStyle=%s timeframe=%s predictionHorizonBars=%s sourceRowCount=%s featureCount=%s warmupRowsRemoved=%s invalidRowsRemoved=%s finalDatasetCount=%s BUY=%s HOLD=%s SELL=%s executionTime=%.2fs",symbol_token,normalized_style.value,timeframe,prediction_horizon_bars,len(source_df),len(self.FEATURE_COLUMNS),filtering_diagnostics["feature_invalid_rows"],filtering_diagnostics["target_skipped_rows"],len(cleaned_df),label_distribution["BUY"],label_distribution["HOLD"],label_distribution["SELL"],time.time() - started_at)
@@ -180,6 +204,82 @@ class DatasetGenerator:
             ),
         }
         return final_df.reset_index(drop=True), diagnostics
+
+    def _label_rows(self, df: pd.DataFrame, buy_threshold_pct: float, sell_threshold_pct: float) -> pd.DataFrame:
+        result = df.copy()
+        result["label"] = "HOLD"
+        result.loc[result["future_return_pct"] >= buy_threshold_pct, "label"] = "BUY"
+        result.loc[result["future_return_pct"] <= sell_threshold_pct, "label"] = "SELL"
+        return result
+
+    def _primary_skip_reasons(self, df: pd.DataFrame) -> dict[str, int]:
+        reasons: dict[str, int] = {}
+        if "future_close" in df.columns:
+            insufficient = df["future_close"].isna() | df["future_return_pct"].isna()
+            reasons["insufficientFutureBars"] = int(insufficient.sum())
+        feature_columns = list(self.FEATURE_COLUMNS)
+        invalid_features = self._feature_validation(df)
+        reasons["invalidFeature"] = int(invalid_features["rowsWithInvalidFeatures"])
+        return reasons
+
+    def _feature_validation(self, df: pd.DataFrame) -> dict[str, int]:
+        feature_columns = list(self.FEATURE_COLUMNS)
+        if not feature_columns:
+            return {"positiveInfinityCount": 0, "rowsWithInvalidFeatures": 0}
+        available = [column for column in feature_columns if column in df.columns]
+        values = df[available]
+        invalid_values = values.replace([float("inf"), float("-inf")], float("nan"))
+        positive_infinity_count = int(((values == float("inf")) | (values == float("-inf"))).sum().sum())
+        invalid_rows = invalid_values.isna().any(axis=1)
+        return {
+            "positiveInfinityCount": positive_infinity_count,
+            "rowsWithInvalidFeatures": int(invalid_rows.sum()),
+        }
+
+    @staticmethod
+    def _dataset_fingerprint(
+        symbol_token: str,
+        trading_style: TradingStyle | str,
+        timeframe: str,
+        prediction_horizon_bars: int,
+        buy_threshold_pct: float,
+        sell_threshold_pct: float,
+        feature_version: str,
+        feature_columns: list[str],
+        dataset_start_time: str | None,
+        dataset_end_time: str | None,
+        dataset_row_count: int,
+    ) -> str:
+        canonical_payload = {
+            "symbolToken": symbol_token,
+            "tradingStyle": TradingStyle.normalize(trading_style).value,
+            "timeframe": timeframe,
+            "predictionHorizonBars": prediction_horizon_bars,
+            "buyThresholdPct": buy_threshold_pct,
+            "sellThresholdPct": sell_threshold_pct,
+            "featureVersion": feature_version,
+            "featureColumns": list(feature_columns),
+            "datasetStartTime": dataset_start_time,
+            "datasetEndTime": dataset_end_time,
+            "datasetRowCount": dataset_row_count,
+        }
+        serialized = json.dumps(canonical_payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _training_eligibility(
+        dataset_row_count: int,
+        feature_count: int,
+        skip_reasons: dict[str, int],
+    ) -> dict[str, object]:
+        reasons = []
+        if dataset_row_count == 0:
+            reasons.append("INSUFFICIENT_SAMPLES")
+        if feature_count == 0:
+            reasons.append("NO_FEATURES")
+        if skip_reasons.get("insufficientFutureBars", 0) > 0:
+            reasons.append("INSUFFICIENT_FUTURE_BARS")
+        return {"eligible": not reasons, "reasons": reasons}
 
     @staticmethod
     def _finite_columns_mask(df: pd.DataFrame, columns: list[str]) -> pd.Series:
