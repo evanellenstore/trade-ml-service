@@ -6,13 +6,12 @@ from typing import Any
 
 import joblib
 import pandas as pd
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report
-from sklearn.preprocessing import LabelEncoder
-from xgboost import XGBClassifier
 
 
-class XGBoostTrainer:
-    """Train and persist an XGBoost classifier for the canonical feature schema."""
+class ScikitLearnTrainer:
+    """Train and persist a deterministic classifier for the canonical feature schema."""
 
     def __init__(self, model_path: str | Path) -> None:
         self.model_path = Path(model_path)
@@ -47,32 +46,19 @@ class XGBoostTrainer:
         if y_train.nunique() < 2:
             raise ValueError("Training data must contain at least two target classes")
 
-        label_encoder = LabelEncoder()
-        y_train_encoded = label_encoder.fit_transform(y_train)
-        y_validation_encoded = label_encoder.transform(y_validation)
-
-        model = XGBClassifier(
-            objective="multi:softprob",
-            eval_metric="mlogloss",
-            n_estimators=200,
-            max_depth=5,
-            learning_rate=0.08,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            min_child_weight=1,
+        model = LogisticRegression(
+            class_weight="balanced",
+            max_iter=1000,
             random_state=42,
-            n_jobs=1,
         )
-        model.fit(X_train, y_train_encoded)
-        model.label_encoder = label_encoder
+        model.fit(X_train, y_train)
 
         validation_predictions = model.predict(X_validation)
-        validation_predictions_labels = label_encoder.inverse_transform(validation_predictions)
-        validation_accuracy = float(accuracy_score(y_validation, validation_predictions_labels))
+        validation_accuracy = float(accuracy_score(y_validation, validation_predictions))
         model_report = classification_report(
             y_validation,
-            validation_predictions_labels,
-            labels=label_encoder.classes_,
+            validation_predictions,
+            labels=sorted(y_train.unique()),
             output_dict=True,
             zero_division=0,
         )
@@ -84,7 +70,7 @@ class XGBoostTrainer:
             "model_path": str(self.model_path),
             "feature_columns": feature_columns,
             "label_column": label_column,
-            "model_type": "XGBClassifier",
+            "model_type": "LogisticRegression",
             "validation_rows": int(len(validation_df)),
             "validation_accuracy": validation_accuracy,
             "validation_report": model_report,

@@ -12,7 +12,7 @@ def test_target_excluded_from_feature_list():
     assert "label" not in dataset.FEATURE_COLUMNS
 
 
-def test_v1_feature_contract_contains_exactly_fifteen_columns():
+def test_v1_feature_contract_contains_exactly_26_columns():
     assert DatasetGenerator.FEATURE_COLUMNS == [
         "return_1",
         "return_5",
@@ -24,6 +24,17 @@ def test_v1_feature_contract_contains_exactly_fifteen_columns():
         "volume_change_pct",
         "rolling_volume_mean",
         "relative_volume",
+        "rsi",
+        "macd",
+        "macd_signal",
+        "macd_histogram",
+        "atr_pct",
+        "adx",
+        "ema_9_distance_pct",
+        "ema_20_distance_pct",
+        "ema_50_distance_pct",
+        "bollinger_position",
+        "bollinger_width_pct",
         "is_doji",
         "is_hammer",
         "is_shooting_star",

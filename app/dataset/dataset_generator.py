@@ -36,13 +36,7 @@ class DatasetGenerator:
         sell_threshold_pct: float = -0.5,trading_style: TradingStyle | str = TradingStyle.INTRADAY,
         start_time: datetime | None = None,end_time: datetime | None = None,) -> DatasetSummary:
         
-        """Generate a dataset using bars from the requested market timeframe.
-
-        ONE_MINUTE uses the existing database candle and indicator path.
-        Higher timeframes are prepared by MarketDataProvider from raw
-        one-minute candles. The prediction horizon always counts bars in the
-        requested timeframe, not minutes.
-        """
+      
         
         started_at = time.time()
         normalized_style = TradingStyle.normalize(trading_style)

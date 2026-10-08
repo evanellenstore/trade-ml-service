@@ -112,6 +112,47 @@ class PurgedChronologicalDatasetSplitter:
             validationChecks=validation_checks,
         )
 
+    def split_frames(
+        self,
+        rows: pd.DataFrame,
+        config: DatasetSplitConfig,
+        *,
+        dataset_fingerprint: str,
+        prediction_horizon_bars: int | None = None,
+        trading_style: TradingStyle | str = TradingStyle.INTRADAY,
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """Return the actual chronological splits used by the training service."""
+        prepared = self._prepare_rows(rows, trading_style)
+        if prepared.empty:
+            raise ValueError("Dataset is empty for splitting")
+
+        boundaries = self._determine_boundaries(prepared, config, trading_style)
+        candidate_train = prepared.iloc[: boundaries["train_end"] + 1].copy()
+        candidate_validation = prepared.iloc[
+            boundaries["train_end"] + 1 : boundaries["validation_end"] + 1
+        ].copy()
+        candidate_test = prepared.iloc[boundaries["validation_end"] + 1 :].copy()
+
+        purge = self._purge_target_overlap(
+            candidate_train,
+            candidate_validation,
+            candidate_test,
+            boundaries,
+            config.purgeEnabled,
+        )
+        embargo = self._apply_embargo(
+            purge["train"],
+            purge["validation"],
+            purge["test"],
+            boundaries,
+            config.embargoBars,
+        )
+        return (
+            embargo["train"].reset_index(drop=True),
+            embargo["validation"].reset_index(drop=True),
+            embargo["test"].reset_index(drop=True),
+        )
+
     @staticmethod
     def _prepare_rows(rows: pd.DataFrame, trading_style: TradingStyle | str) -> pd.DataFrame:
         required = [

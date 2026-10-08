@@ -99,7 +99,7 @@ def test_feature_matrix_is_exact_schema_and_contains_no_future_columns():
     frame = _synthetic_frame()
     matrix = FeatureEngineering().feature_matrix(FeatureEngineering().transform(frame))
     assert list(matrix.columns) == FEATURE_SCHEMA.columns
-    assert matrix.shape[1] == 15
+    assert matrix.shape[1] == 26
     assert not matrix.isna().any().any()
     assert np.isfinite(matrix.to_numpy(dtype=float)).all()
 

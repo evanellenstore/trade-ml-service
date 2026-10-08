@@ -15,6 +15,17 @@ class FeatureLeakageValidator:
         "future_return_pct",
         "label",
         "target",
+        "featureTimestamp",
+        "targetEndTimestamp",
+        "candle_id",
+        "symbol_token",
+        "timeframe",
+        "candle_time",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
     }
     FUTURE_PREFIXES = ("future_", "next_", "predicted_", "forecast_")
 

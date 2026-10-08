@@ -13,7 +13,7 @@ from app.features.feature_schema import FeatureSchema
 from app.schemas.dataset_schema import DatasetSummary
 
 
-def test_feature_schema_is_central_and_exactly_fifteen_columns():
+def test_feature_schema_is_central_and_exactly_26_columns():
     expected = [
         "return_1",
         "return_5",
@@ -25,6 +25,17 @@ def test_feature_schema_is_central_and_exactly_fifteen_columns():
         "volume_change_pct",
         "rolling_volume_mean",
         "relative_volume",
+        "rsi",
+        "macd",
+        "macd_signal",
+        "macd_histogram",
+        "atr_pct",
+        "adx",
+        "ema_9_distance_pct",
+        "ema_20_distance_pct",
+        "ema_50_distance_pct",
+        "bollinger_position",
+        "bollinger_width_pct",
         "is_doji",
         "is_hammer",
         "is_shooting_star",
@@ -152,10 +163,10 @@ def test_summary_model_accepts_new_audit_fields():
         sourceRowCount=2,
         datasetRowCount=1,
         skippedRowCount=1,
-        featureCount=15,
+        featureCount=26,
         featureVersion="v1",
         labelDistribution={"BUY": 1, "HOLD": 0, "SELL": 0},
-        featureSchema={"version": "v1", "count": 15, "features": ["return_1"]},
+        featureSchema={"version": "v1", "count": 26, "features": ["return_1"]},
         skipReasons={"crossSessionHorizon": 1},
         trainingEligibility={"eligible": True, "reasons": []},
         featureValidation={
@@ -177,7 +188,7 @@ def test_summary_model_accepts_new_audit_fields():
         },
     )
 
-    assert summary.featureSchema.count == 15
+    assert summary.featureSchema.count == 26
     assert summary.trainingEligibility.eligible is True
     assert summary.trainingEligibility.reasons == []
     assert summary.featureValidation.featureWarmupRows == 1

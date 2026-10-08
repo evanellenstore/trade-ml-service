@@ -66,7 +66,7 @@ def test_splitter_is_deterministic_and_keeps_v1_features_unchanged() -> None:
     assert first.train.startTime == second.train.startTime
     assert first.test.endTime == second.test.endTime
     assert first.train.featureSchemaValid is True
-    assert first.train.featureCount == 15
+    assert first.train.featureCount == 26
     assert first.train.features == list(FEATURE_SCHEMA.columns)
     assert first.validationChecks.noDuplicateRows is True
     assert first.validationChecks.chronologicalOrderValid is True
@@ -172,6 +172,6 @@ def test_generated_dataset_preserves_target_metadata_without_feature_schema_chan
     )
 
     assert summary.featureVersion == "v1"
-    assert summary.featureCount == 15
-    assert len(summary.featureSchema.features) == 15
+    assert summary.featureCount == 26
+    assert len(summary.featureSchema.features) == 26
     assert DatasetGenerator.FEATURE_COLUMNS == FEATURE_SCHEMA.columns
