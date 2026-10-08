@@ -42,6 +42,16 @@ class PredictionService:
     def _decode_prediction(self, prediction: int | str) -> str:
         if hasattr(self.model, "label_encoder"):
             return str(self.model.label_encoder.inverse_transform([prediction])[0])
+        if hasattr(self.model, "class_labels_"):
+            labels = getattr(self.model, "class_labels_")
+            if isinstance(labels, (list, tuple, pd.Index)):
+                return str(labels[int(prediction)])
+            if hasattr(labels, "__len__") and len(labels) > 0:
+                return str(labels[int(prediction)])
+        if hasattr(self.model, "classes_"):
+            classes = getattr(self.model, "classes_")
+            if hasattr(classes, "__len__") and len(classes) > 0:
+                return str(classes[int(prediction)])
         return str(prediction)
 
     def predict(self, df: pd.DataFrame) -> dict[str, Any]:
