@@ -27,12 +27,13 @@ class ModelTrainingService:
         trainer: XGBoostTrainer | None = None,
         model_directory: str | None = None,
     ) -> None:
+        self.model_directory = model_directory or settings.model_directory
         self.generator = generator or DatasetGenerator()
         self.splitter = splitter or PurgedChronologicalDatasetSplitter()
         self.trainer = trainer or XGBoostTrainer(
             model_path=model_path_for(
                 TradingStyle.INTRADAY,
-                model_directory or settings.model_directory,
+                self.model_directory,
             )
         )
 
@@ -104,7 +105,7 @@ class ModelTrainingService:
             raise ValueError("Chronological split must contain train, validation, and test rows")
 
         normalized_style = TradingStyle.normalize(trading_style)
-        style_model_path = model_path_for(normalized_style, model_directory or settings.model_directory)
+        style_model_path = model_path_for(normalized_style, self.model_directory)
         if self.trainer.model_path != style_model_path:
             self.trainer = XGBoostTrainer(model_path=style_model_path)
 
