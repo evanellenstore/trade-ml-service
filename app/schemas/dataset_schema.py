@@ -102,3 +102,64 @@ class DatasetGenerationResponse(BaseModel):
     success: bool
     message: str
     data: DatasetSummary
+
+
+class DatasetSplitRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    symbolToken: str = Field(..., min_length=1)
+    tradingStyle: TradingStyle = Field(default=TradingStyle.INTRADAY)
+    timeframe: str = Field(..., min_length=1)
+    predictionHorizonBars: Optional[int] = Field(default=None, ge=1)
+    buyThresholdPct: float = Field(default=0.5)
+    sellThresholdPct: float = Field(default=-0.5)
+    startTime: Optional[datetime] = None
+    endTime: Optional[datetime] = None
+
+    trainRatio: float = Field(default=0.70, gt=0.0)
+    validationRatio: float = Field(default=0.15, gt=0.0)
+    testRatio: float = Field(default=0.15, gt=0.0)
+    purgeEnabled: bool = True
+    embargoBars: int = Field(default=0, ge=0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def apply_default_horizon(cls, data):
+        if isinstance(data, dict) and "predictionHorizonBars" not in data:
+            data["predictionHorizonBars"] = 15
+        return data
+
+    @field_validator("timeframe")
+    @classmethod
+    def validate_timeframe(cls, value: str) -> str:
+        return Timeframe.normalize(value).value
+
+    @field_validator("buyThresholdPct")
+    @classmethod
+    def validate_buy_threshold(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("buyThresholdPct must be positive")
+        return value
+
+    @field_validator("sellThresholdPct")
+    @classmethod
+    def validate_sell_threshold(cls, value: float) -> float:
+        if value >= 0:
+            raise ValueError("sellThresholdPct must be negative")
+        return value
+
+    @model_validator(mode="after")
+    def validate_ratios(self):
+        total = self.trainRatio + self.validationRatio + self.testRatio
+        if abs(total - 1.0) > 1e-9:
+            raise ValueError(
+                "split ratios must sum to 1.0; "
+                f"received {self.trainRatio} + {self.validationRatio} + {self.testRatio}"
+            )
+        return self
+
+
+class DatasetSplitResponse(BaseModel):
+    success: bool
+    message: str
+    data: object

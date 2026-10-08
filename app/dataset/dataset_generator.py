@@ -30,6 +30,7 @@ class DatasetGenerator:
         self.market_data_provider = MarketDataProvider()
         self.feature_engineering = FeatureEngineering()
         self.label_generator = LabelGenerator()
+        self.supervised_rows: pd.DataFrame | None = None
 
     def generate_dataset(self,symbol_token: str,timeframe: str, prediction_horizon_bars: int,buy_threshold_pct: float = 0.5,
         sell_threshold_pct: float = -0.5,trading_style: TradingStyle | str = TradingStyle.INTRADAY,
@@ -63,10 +64,16 @@ class DatasetGenerator:
         # horizon always refers to actual market bars in the requested timeframe.
 
         labeled_df = self.label_generator.generate_labels(feature_df,prediction_horizon_bars=prediction_horizon_bars,buy_threshold_pct=buy_threshold_pct,sell_threshold_pct=sell_threshold_pct,trading_style=normalized_style)
+        labeled_df = self._add_supervised_metadata(
+            labeled_df,
+            prediction_horizon_bars=prediction_horizon_bars,
+            trading_style=normalized_style,
+        )
 
         # Filter out rows with incomplete features or invalid targets. The final
         # dataset is guaranteed to have all declared v1 features and valid labels.
         cleaned_df, filtering_diagnostics = self._finalize_dataset(labeled_df)
+        self.supervised_rows = cleaned_df
 
         label_distribution = {
             "BUY": int((cleaned_df["label"] == "BUY").sum()),
@@ -193,12 +200,6 @@ class DatasetGenerator:
         if final_df.empty:
             raise ValueError("Dataset is empty after filtering invalid rows")
 
-        metadata_columns = {"candle_id", "symbol_token", "timeframe", "candle_time", "trading_date"}
-        final_columns = [
-            column for column in required_columns + feature_columns + ["future_close", "future_return_pct", "label"]
-            if column not in metadata_columns or column in final_df.columns
-        ]
-        final_df = final_df[final_columns].copy()
         feature_matrix = final_df[feature_columns]
         if not feature_matrix.apply(pd.api.types.is_numeric_dtype).all():
             raise ValueError("Dataset contains non-numeric feature columns")
@@ -217,6 +218,24 @@ class DatasetGenerator:
             ),
         }
         return final_df.reset_index(drop=True), diagnostics
+
+    @staticmethod
+    def _add_supervised_metadata(
+        df: pd.DataFrame,
+        *,
+        prediction_horizon_bars: int,
+        trading_style: TradingStyle | str,
+    ) -> pd.DataFrame:
+        result = df.copy()
+        result["featureTimestamp"] = pd.to_datetime(result["candle_time"])
+        group_columns = ["symbol_token", "timeframe"]
+        if TradingStyle.normalize(trading_style) == TradingStyle.INTRADAY and "trading_date" in result.columns:
+            group_columns.append("trading_date")
+        target_times = result.groupby(group_columns, dropna=False)["candle_time"].shift(
+            -prediction_horizon_bars
+        )
+        result["targetEndTimestamp"] = pd.to_datetime(target_times)
+        return result
 
     def _label_rows(self, df: pd.DataFrame, buy_threshold_pct: float, sell_threshold_pct: float) -> pd.DataFrame:
         result = df.copy()
