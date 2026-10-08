@@ -40,18 +40,34 @@ class PredictionService:
         return self.feature_engineering.feature_matrix(df)
 
     def _decode_prediction(self, prediction: int | str) -> str:
+        canonical = ["SELL", "HOLD", "BUY"]
         if hasattr(self.model, "label_encoder"):
-            return str(self.model.label_encoder.inverse_transform([prediction])[0])
+            encoder = getattr(self.model, "label_encoder")
+            if hasattr(encoder, "inverse_transform"):
+                return str(encoder.inverse_transform([prediction])[0])
+            if isinstance(encoder, dict):
+                reverse = encoder.get("reverseMapping", {})
+                if isinstance(reverse, dict):
+                    return str(reverse.get(int(prediction), prediction))
+
         if hasattr(self.model, "class_labels_"):
             labels = getattr(self.model, "class_labels_")
             if isinstance(labels, (list, tuple, pd.Index)):
                 return str(labels[int(prediction)])
             if hasattr(labels, "__len__") and len(labels) > 0:
                 return str(labels[int(prediction)])
+
         if hasattr(self.model, "classes_"):
             classes = getattr(self.model, "classes_")
             if hasattr(classes, "__len__") and len(classes) > 0:
-                return str(classes[int(prediction)])
+                values = list(classes)
+                if set(values) == {0, 1, 2}:
+                    return str(canonical[int(prediction)])
+                return str(values[int(prediction)])
+
+        if isinstance(prediction, (int, float)) and int(prediction) in {0, 1, 2}:
+            return canonical[int(prediction)]
+
         return str(prediction)
 
     def predict(self, df: pd.DataFrame) -> dict[str, Any]:

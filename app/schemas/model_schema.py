@@ -1,11 +1,29 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import Enum
 from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.domain.trading_style import TradingStyle
+
+
+class ValidationStrategy(str, Enum):
+    HOLDOUT = "HOLDOUT"
+    WALK_FORWARD = "WALK_FORWARD"
+
+
+class WalkForwardConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    foldCount: int = Field(default=4, ge=1)
+    validationWindowSessions: int = Field(default=60, ge=1)
+    expandingWindow: bool = True
+    sessionAligned: bool = True
+    purgeEnabled: bool = True
+    embargoBars: int = Field(default=0, ge=0)
+    minimumTrainingSessions: Optional[int] = Field(default=None, ge=1)
 
 
 class ModelTrainRequest(BaseModel):
@@ -24,6 +42,8 @@ class ModelTrainRequest(BaseModel):
     testRatio: float = Field(default=0.15, gt=0.0)
     purgeEnabled: bool = True
     embargoBars: int = Field(default=0, ge=0)
+    validationStrategy: ValidationStrategy = ValidationStrategy.HOLDOUT
+    walkForward: Optional[WalkForwardConfig] = None
 
     @field_validator("timeframe")
     @classmethod

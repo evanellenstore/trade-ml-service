@@ -14,8 +14,10 @@ from app.dataset.split.purged_chronological_dataset_splitter import PurgedChrono
 from app.domain.trading_style import TradingStyle
 from app.features.feature_schema import FEATURE_SCHEMA
 from app.model.model_registry import artifact_dir_for, model_id_for, model_path_for
+from app.schemas.model_schema import ValidationStrategy, WalkForwardConfig
 from app.training.lightgbm_trainer import LightGBMTrainer
 from app.training.model_evaluator import ModelEvaluator
+from app.training.walk_forward import WalkForwardConfig as WalkForwardSpec, WalkForwardTrainer
 from app.training.xgboost_trainer import XGBoostTrainer
 
 
@@ -63,6 +65,8 @@ class ModelTrainingService:
         test_ratio: float = 0.15,
         purge_enabled: bool = True,
         embargo_bars: int = 0,
+        validation_strategy: ValidationStrategy | str = ValidationStrategy.HOLDOUT,
+        walk_forward: WalkForwardConfig | WalkForwardSpec | None = None,
     ) -> dict[str, Any]:
         dataset_summary = self.generator.generate_dataset(
             symbol_token=symbol_token,
@@ -78,6 +82,96 @@ class ModelTrainingService:
         rows = self.generator.supervised_rows
         if rows is None or rows.empty:
             raise ValueError("Dataset generation did not produce training rows")
+
+        normalized_strategy = ValidationStrategy(validation_strategy) if not isinstance(validation_strategy, ValidationStrategy) else validation_strategy
+        feature_columns = list(FEATURE_SCHEMA.columns)
+
+        if normalized_strategy == ValidationStrategy.WALK_FORWARD:
+            config = walk_forward or WalkForwardConfig(
+                foldCount=4,
+                validationWindowSessions=60,
+                expandingWindow=True,
+                sessionAligned=True,
+                purgeEnabled=purge_enabled,
+                embargoBars=embargo_bars,
+            )
+            if isinstance(config, WalkForwardConfig):
+                wf_config = config
+            else:
+                wf_config = WalkForwardConfig(
+                    foldCount=getattr(config, "foldCount", 4),
+                    validationWindowSessions=getattr(config, "validationWindowSessions", 60),
+                    expandingWindow=getattr(config, "expandingWindow", True),
+                    sessionAligned=getattr(config, "sessionAligned", True),
+                    purgeEnabled=getattr(config, "purgeEnabled", purge_enabled),
+                    embargoBars=getattr(config, "embargoBars", embargo_bars),
+                    minimumTrainingSessions=getattr(config, "minimumTrainingSessions", None),
+                )
+            if "trading_date" not in rows.columns:
+                raise ValueError("Walk-forward validation requires trading_date metadata")
+            split_config = DatasetSplitConfig(
+                trainRatio=train_ratio,
+                validationRatio=validation_ratio,
+                testRatio=test_ratio,
+                purgeEnabled=purge_enabled,
+                embargoBars=embargo_bars,
+            )
+            trainer = WalkForwardTrainer()
+            candidate = {
+                "max_depth": 4,
+                "learning_rate": 0.03,
+                "min_child_weight": 3,
+                "subsample": 0.85,
+                "colsample_bytree": 0.85,
+                "gamma": 0.05,
+                "reg_alpha": 0.01,
+                "reg_lambda": 2.0,
+                "n_estimators": 200,
+                "early_stopping_rounds": 20,
+            }
+            evaluation = trainer.evaluate_candidate(
+                rows=rows,
+                config=wf_config,
+                split_config=split_config,
+                dataset_fingerprint=dataset_summary.datasetFingerprint or "",
+                prediction_horizon_bars=prediction_horizon_bars,
+                trading_style=trading_style,
+                feature_columns=feature_columns,
+                trainer_factory=XGBoostTrainer,
+                candidate_params=candidate,
+            )
+            normalized_style = TradingStyle.normalize(trading_style)
+            walk_forward_model_id = (
+                f"{symbol_token}_{normalized_style.value}_{timeframe.upper()}_"
+                f"{prediction_horizon_bars}_XGBOOST_{FEATURE_SCHEMA.version}_"
+                f"{evaluation['walkForwardFingerprint'][:16]}"
+            )
+            return {
+                "status": "WALK_FORWARD_VALIDATED",
+                "validationStrategy": "WALK_FORWARD",
+                "testEvaluated": False,
+                "testLocked": True,
+                "modelId": walk_forward_model_id,
+                "selectedHyperparameters": candidate,
+                "walkForward": {
+                    "foldCount": evaluation["foldCount"],
+                    "expandingWindow": wf_config.expandingWindow,
+                    "validationWindowSessions": wf_config.validationWindowSessions,
+                    "folds": evaluation["folds"],
+                    "aggregate": evaluation["aggregate"],
+                    "lockedTest": evaluation["lockedTest"],
+                    "developmentData": evaluation["developmentData"],
+                    "walkForwardCoverage": evaluation["walkForwardCoverage"],
+                    "walkForwardFingerprint": evaluation["walkForwardFingerprint"],
+                    "excludedBoundaryRows": evaluation["excludedBoundaryRows"],
+                    "rowReconciliationValid": evaluation["rowReconciliationValid"],
+                },
+                "dataset": dataset_summary.model_dump(mode="json"),
+                "feature_columns": feature_columns,
+                "testLocked": True,
+                "testEvaluated": False,
+                "lifecycleStatus": "WALK_FORWARD_VALIDATED",
+            }
 
         split_config = DatasetSplitConfig(
             trainRatio=train_ratio,
@@ -103,7 +197,6 @@ class ModelTrainingService:
         if train_df.empty or validation_df.empty or test_df.empty:
             raise ValueError("Chronological split must contain train, validation, and test rows")
 
-        feature_columns = list(FEATURE_SCHEMA.columns)
         X_train = self._feature_matrix(train_df, feature_columns)
         X_validation = self._feature_matrix(validation_df, feature_columns)
         if X_train.shape != (len(train_df), 26):

@@ -10,10 +10,13 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.metrics import log_loss
-from sklearn.preprocessing import LabelEncoder
 
 from app.features.feature_schema import FEATURE_SCHEMA
 from app.training.model_evaluator import ModelEvaluator
+
+CANONICAL_CLASS_ORDER = ["SELL", "HOLD", "BUY"]
+CANONICAL_CLASS_ENCODING = {label: index for index, label in enumerate(CANONICAL_CLASS_ORDER)}
+CANONICAL_CLASS_DECODING = {index: label for label, index in CANONICAL_CLASS_ENCODING.items()}
 
 try:
     from xgboost import XGBClassifier
@@ -96,6 +99,23 @@ class XGBoostTrainer:
         ]
         return candidates
 
+    @staticmethod
+    def _encode_canonical_labels(values: pd.Series | list[str] | np.ndarray) -> np.ndarray:
+        normalized = pd.Series(values).astype(str)
+        encoded = normalized.map(CANONICAL_CLASS_ENCODING).to_numpy(dtype=int)
+        if np.isnan(encoded).any():
+            missing = sorted(set(normalized.unique()) - set(CANONICAL_CLASS_ENCODING))
+            raise ValueError(f"Unsupported canonical labels detected: {missing}")
+        return encoded
+
+    @staticmethod
+    def _decode_canonical_labels(values: pd.Series | list[int] | np.ndarray) -> np.ndarray:
+        as_int = pd.Series(values).astype(int)
+        decoded = as_int.map(CANONICAL_CLASS_DECODING).astype(str).to_numpy(dtype=object)
+        if (as_int < 0).any() or (as_int > 2).any():
+            raise ValueError("Decoded prediction values fall outside canonical encoding")
+        return decoded
+
     def _fit_candidate(
         self,
         *,
@@ -106,9 +126,8 @@ class XGBoostTrainer:
         hyperparameters: dict[str, Any],
         label_order: list[str],
     ) -> dict[str, Any]:
-        label_encoder = LabelEncoder()
-        y_train_encoded = label_encoder.fit_transform(y_train)
-        y_validation_encoded = label_encoder.transform(y_validation)
+        y_train_encoded = self._encode_canonical_labels(y_train)
+        y_validation_encoded = self._encode_canonical_labels(y_validation)
         model = XGBClassifier(
             objective="multi:softprob",
             eval_metric="mlogloss",
@@ -131,13 +150,12 @@ class XGBoostTrainer:
             eval_set=[(X_validation, y_validation_encoded)],
             verbose=False,
         )
-        model.label_encoder = label_encoder
-        model.class_labels_ = np.asarray(label_encoder.classes_, dtype=object)
+        model.canonical_class_order_ = np.asarray(CANONICAL_CLASS_ORDER, dtype=object)
         validation_probabilities = model.predict_proba(X_validation)
         validation_predictions = model.predict(X_validation)
-        validation_predictions_labels = label_encoder.inverse_transform(validation_predictions)
+        validation_predictions_labels = self._decode_canonical_labels(validation_predictions)
         metrics = ModelEvaluator.evaluate_predictions(y_validation, validation_predictions_labels, labels=label_order)
-        metrics["logLoss"] = float(log_loss(y_validation, validation_probabilities, labels=label_order))
+        metrics["logLoss"] = float(log_loss(y_validation, validation_probabilities, labels=CANONICAL_CLASS_ORDER))
         metrics["bestIteration"] = getattr(model, "best_iteration", None)
         metrics["bestScore"] = getattr(model, "best_score", None)
         return {
@@ -146,7 +164,7 @@ class XGBoostTrainer:
             "validation_accuracy": float(metrics["accuracy"]),
             "probabilities": validation_probabilities,
             "trainedModel": model,
-            "labelEncoder": label_encoder,
+            "labelEncoder": {"mapping": CANONICAL_CLASS_ENCODING, "reverseMapping": CANONICAL_CLASS_DECODING},
         }
 
     def train(

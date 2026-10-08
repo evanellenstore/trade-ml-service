@@ -29,6 +29,8 @@ def train_model(payload: ModelTrainRequest) -> ModelTrainingResponse:
             test_ratio=payload.testRatio,
             purge_enabled=payload.purgeEnabled,
             embargo_bars=payload.embargoBars,
+            validation_strategy=payload.validationStrategy,
+            walk_forward=payload.walkForward,
         )
         
         print(f"---------- Model training result: {result}")  # Debugging line to print the result
