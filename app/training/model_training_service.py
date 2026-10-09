@@ -14,7 +14,7 @@ from app.dataset.split.purged_chronological_dataset_splitter import PurgedChrono
 from app.domain.trading_style import TradingStyle
 from app.features.feature_schema import FEATURE_SCHEMA
 from app.model.model_registry import artifact_dir_for, model_id_for, model_path_for
-from app.schemas.model_schema import ValidationStrategy, WalkForwardConfig
+from app.schemas.model_schema import OOFAnalysisConfig, ValidationStrategy, WalkForwardConfig
 from app.training.lightgbm_trainer import LightGBMTrainer
 from app.training.model_evaluator import ModelEvaluator
 from app.training.walk_forward import WalkForwardConfig as WalkForwardSpec, WalkForwardTrainer
@@ -67,6 +67,7 @@ class ModelTrainingService:
         embargo_bars: int = 0,
         validation_strategy: ValidationStrategy | str = ValidationStrategy.HOLDOUT,
         walk_forward: WalkForwardConfig | WalkForwardSpec | None = None,
+        oof_analysis: OOFAnalysisConfig | None = None,
     ) -> dict[str, Any]:
         dataset_summary = self.generator.generate_dataset(
             symbol_token=symbol_token,
@@ -139,6 +140,8 @@ class ModelTrainingService:
                 feature_columns=feature_columns,
                 trainer_factory=XGBoostTrainer,
                 candidate_params=candidate,
+                oof_analysis=oof_analysis,
+                oof_artifact_directory=str(Path(self.model_directory) / "oof"),
             )
             normalized_style = TradingStyle.normalize(trading_style)
             walk_forward_model_id = (
@@ -166,6 +169,7 @@ class ModelTrainingService:
                     "excludedBoundaryRows": evaluation["excludedBoundaryRows"],
                     "rowReconciliationValid": evaluation["rowReconciliationValid"],
                 },
+                "outOfFold": evaluation["outOfFold"],
                 "dataset": dataset_summary.model_dump(mode="json"),
                 "feature_columns": feature_columns,
                 "testLocked": True,

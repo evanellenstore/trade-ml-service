@@ -9,6 +9,7 @@ from app.features.feature_schema import FEATURE_SCHEMA
 from app.schemas.model_schema import ModelTrainRequest, ValidationStrategy, WalkForwardConfig
 from app.training.walk_forward import WalkForwardConfig as WalkForwardSpec
 from app.training.walk_forward import WalkForwardSplitter, WalkForwardTrainer
+from app.training.oof_analysis import OOFAnalyzer
 
 
 def _synthetic_rows(*, session_count: int = 360, rows_per_session: int = 5) -> pd.DataFrame:
@@ -29,6 +30,8 @@ def _synthetic_rows(*, session_count: int = 360, rows_per_session: int = 5) -> p
                     "trading_date": session_start.date(),
                     "featureTimestamp": feature_time,
                     "targetEndTimestamp": target_end,
+                    "open": float(100 + session_index + minute_offset),
+                    "future_close": float(101 + session_index + minute_offset),
                     "label": "HOLD",
                     **{column: float(minute_offset + session_index + idx) for idx, column in enumerate(FEATURE_SCHEMA.columns)},
                 }
@@ -61,6 +64,8 @@ def test_model_train_request_accepts_walk_forward_strategy() -> None:
     assert payload.validationStrategy == ValidationStrategy.WALK_FORWARD
     assert payload.walkForward is not None
     assert payload.walkForward.foldCount == 4
+    assert payload.oofAnalysis.confidenceThresholds == [0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
+    assert payload.oofAnalysis.marginThresholds == [0.05, 0.10, 0.15, 0.20, 0.25]
 
 
 def test_walk_forward_splitter_generates_non_overlapping_validation_windows() -> None:
@@ -165,7 +170,7 @@ def test_fold_four_uses_latest_development_sessions_without_test_overlap() -> No
     assert folds[0]["train"]["sessionCount"] < folds[-1]["train"]["sessionCount"]
 
 
-def test_walk_forward_evaluation_never_predicts_on_locked_test_rows(monkeypatch) -> None:
+def test_walk_forward_evaluation_never_predicts_on_locked_test_rows(monkeypatch, tmp_path) -> None:
     rows = _synthetic_rows(session_count=10, rows_per_session=5)
     rows.loc[rows["candle_id"].str.endswith("-1"), "label"] = "BUY"
     config = DatasetSplitConfig(trainRatio=0.70, validationRatio=0.15, testRatio=0.15)
@@ -182,7 +187,11 @@ def test_walk_forward_evaluation_never_predicts_on_locked_test_rows(monkeypatch)
     class FakeModel:
         def predict(self, matrix: pd.DataFrame) -> np.ndarray:
             predicted_ids.extend(matrix.index.astype(str))
-            return np.ones(len(matrix), dtype=int)
+            offset_predictions = {"0": 0, "1": 2, "2": 1, "3": 2, "4": 0}
+            return np.asarray(
+                [offset_predictions[candle_id.rsplit("-", 1)[-1]] for candle_id in matrix.index.astype(str)],
+                dtype=int,
+            )
 
         def predict_proba(self, matrix: pd.DataFrame) -> np.ndarray:
             predict_proba_calls.append(len(matrix))
@@ -194,8 +203,18 @@ def test_walk_forward_evaluation_never_predicts_on_locked_test_rows(monkeypatch)
         @staticmethod
         def _fit_candidate(**kwargs):
             validation = kwargs["X_validation"]
+            class_ids = [
+                {"0": 0, "1": 2, "2": 1, "3": 2, "4": 0}[candle_id.rsplit("-", 1)[-1]]
+                for candle_id in validation.index.astype(str)
+            ]
+            probabilities = np.asarray(
+                [
+                    [[0.75, 0.15, 0.10], [0.10, 0.15, 0.75], [0.10, 0.80, 0.10]][class_id]
+                    for class_id in class_ids
+                ]
+            )
             return {
-                "probabilities": np.tile([0.1, 0.8, 0.1], (len(validation), 1)),
+                "probabilities": probabilities,
                 "trainedModel": FakeModel(),
             }
 
@@ -230,6 +249,7 @@ def test_walk_forward_evaluation_never_predicts_on_locked_test_rows(monkeypatch)
         feature_columns=list(FEATURE_SCHEMA.columns),
         trainer_factory=lambda **kwargs: FakeTrainer(),
         candidate_params={"max_depth": 2},
+        oof_artifact_directory=str(tmp_path),
     )
 
     assert set(predicted_ids).isdisjoint(test_ids)
@@ -238,6 +258,34 @@ def test_walk_forward_evaluation_never_predicts_on_locked_test_rows(monkeypatch)
     assert result["testLocked"] is True
     assert result["walkForwardCoverage"]["noWalkForwardTestOverlap"] is True
     assert result["rowReconciliationValid"] is True
+    out_of_fold = result["outOfFold"]
+    assert out_of_fold["predictionCount"] == sum(fold["validation"]["rows"] for fold in result["folds"])
+    stored_oof = pd.read_csv(out_of_fold["predictionArtifact"])
+    expected_validation_ids = {
+        str(candle_id)
+        for fold in WalkForwardSplitter().create_folds(
+            WalkForwardSplitter.reserve_test_rows(
+                rows,
+                train_ratio=config.trainRatio,
+                validation_ratio=config.validationRatio,
+                test_ratio=config.testRatio,
+            )[0],
+            WalkForwardConfig(foldCount=2, validationWindowSessions=2, expandingWindow=True),
+        )
+        for candle_id in fold["validationDataFrame"]["candle_id"]
+    }
+    assert set(stored_oof["candleId"].astype(str)) == expected_validation_ids
+    assert set(stored_oof["candleId"].astype(str)).isdisjoint(test_ids)
+    assert out_of_fold["confidenceAnalysis"]
+    assert out_of_fold["marginAnalysis"]
+    assert out_of_fold["combinedAnalysis"]
+    assert out_of_fold["backtests"]
+    assert all(policy["holdRule"] == "NO_TRADE" for policy in out_of_fold["signalPolicies"])
+    assert all(backtest["buyTradeCount"] + backtest["sellTradeCount"] == backtest["tradeCount"] for backtest in out_of_fold["backtests"])
+    if out_of_fold["bestConfidencePolicy"] is not None:
+        assert out_of_fold["bestConfidencePolicy"]["tradeCount"] > 0
+    if out_of_fold["bestCombinedPolicy"] is not None:
+        assert out_of_fold["bestCombinedPolicy"]["tradeCount"] > 0
     assert all(fold["confusionMatrix"]["classOrder"] == ["SELL", "HOLD", "BUY"] for fold in result["folds"])
     assert all(
         sum(map(sum, fold["confusionMatrix"]["matrix"])) == fold["validation"]["rows"]
@@ -274,3 +322,60 @@ def test_walk_forward_fingerprint_changes_with_test_boundary() -> None:
 
     assert first == repeated
     assert first != changed
+
+
+def test_oof_records_and_threshold_metrics_use_only_validation_predictions() -> None:
+    rows = _synthetic_rows(session_count=8, rows_per_session=3)
+    validation_rows = rows.iloc[:6].copy()
+    actual = pd.Series(["BUY", "HOLD", "HOLD", "SELL", "SELL", "HOLD"])
+    predictions = np.asarray(["BUY", "SELL", "HOLD", "BUY", "SELL", "HOLD"])
+    probabilities = np.asarray(
+        [
+            [0.10, 0.15, 0.75],
+            [0.75, 0.15, 0.10],
+            [0.10, 0.80, 0.10],
+            [0.08, 0.12, 0.80],
+            [0.80, 0.10, 0.10],
+            [0.10, 0.80, 0.10],
+        ]
+    )
+    records = OOFAnalyzer.create_records(
+        validation_rows=validation_rows,
+        actual_labels=actual,
+        predicted_labels=predictions,
+        probabilities=probabilities,
+        fold_number=1,
+    )
+    result = OOFAnalyzer.analyze(
+        records=records,
+        development_rows=rows,
+        trading_style="INTRADAY",
+        locked_test_start=(rows["featureTimestamp"].max() + pd.Timedelta(days=1)),
+        confidence_thresholds=[0.5, 0.75],
+        margin_thresholds=[0.1, 0.5],
+        combined_thresholds=[{"confidenceThreshold": 0.75, "marginThreshold": 0.5}],
+        costs={
+            "brokerage": 10.0,
+            "transactionCostPct": 0.01,
+            "slippagePct": 0.02,
+            "sttPct": 0.01,
+            "exchangeFeePct": 0.01,
+        },
+        capital_per_trade=100000,
+        minimum_trade_count=1,
+    )
+
+    assert len(records) == result["predictionCount"] == len(validation_rows)
+    assert records[0]["confidence"] == 0.75
+    assert records[0]["margin"] == 0.60
+    threshold = result["confidenceAnalysis"][1]
+    assert threshold["predictionCount"] == len(validation_rows)
+    assert threshold["BUY"]["predictedCount"] == 2
+    assert threshold["SELL"]["predictedCount"] == 2
+    assert threshold["HOLD"]["predictedCount"] == 2
+    assert result["combinedAnalysis"][0]["predictionCount"] == 6
+    assert result["backtestAssumptions"]["costs"]["brokerage"] == 10.0
+    assert all(backtest["tradeCount"] >= 0 for backtest in result["backtests"])
+    assert all(backtest["grossReturnPct"] >= backtest["netReturnPct"] for backtest in result["backtests"])
+    assert all(backtest["buySignalCount"] + backtest["sellSignalCount"] == backtest["signalCount"] for backtest in result["backtests"])
+    assert all(abs(backtest["roundTripCostPct"] - 0.11) < 1e-9 for backtest in result["backtests"])

@@ -13,6 +13,7 @@ from app.dataset.split.dataset_split_config import DatasetSplitConfig
 from app.dataset.split.purged_chronological_dataset_splitter import PurgedChronologicalDatasetSplitter
 from app.features.feature_schema import FEATURE_SCHEMA
 from app.training.model_evaluator import ModelEvaluator
+from app.training.oof_analysis import OOFAnalyzer
 from app.training.xgboost_trainer import XGBoostTrainer
 
 
@@ -292,6 +293,7 @@ class WalkForwardSplitter:
         embargo_bars: int,
         fold_boundaries: list[dict[str, Any]],
         candidate_params: dict[str, Any],
+        oof_analysis: Any = None,
         model_identity: dict[str, Any],
     ) -> str:
         payload = {
@@ -381,6 +383,8 @@ class WalkForwardTrainer:
         feature_columns: list[str],
         trainer_factory: Any,
         candidate_params: dict[str, Any],
+        oof_analysis: Any = None,
+        oof_artifact_directory: str | None = None,
     ) -> dict[str, Any]:
         splitter = WalkForwardSplitter()
         development_rows, test_rows, reservation = splitter.reserve_test_partition(
@@ -394,6 +398,7 @@ class WalkForwardTrainer:
         )
         fold_specs = splitter.create_folds(development_rows, config)
         fold_results: list[dict[str, Any]] = []
+        oof_records: list[dict[str, Any]] = []
         test_ids = reservation["testRowIds"]
         test_sessions = reservation["testSessions"]
         test_start = reservation["testStartTimestamp"]
@@ -478,6 +483,15 @@ class WalkForwardTrainer:
                 raise ValueError("Probability rows do not contain exactly three class outputs")
             if not np.allclose(probabilities.sum(axis=1), 1.0, atol=1e-6):
                 raise ValueError("Probability rows do not sum to approximately 1")
+            oof_records.extend(
+                OOFAnalyzer.create_records(
+                    validation_rows=validation_df,
+                    actual_labels=y_validation,
+                    predicted_labels=validation_predictions_labels,
+                    probabilities=probabilities,
+                    fold_number=fold["foldNumber"],
+                )
+            )
             labels = ["SELL", "HOLD", "BUY"]
             metrics = ModelEvaluator.evaluate_predictions(y_validation, validation_predictions_labels, labels=labels)
             metrics["logLoss"] = float(ModelEvaluator.log_loss_metrics(y_validation, probabilities, labels=labels))
@@ -592,6 +606,37 @@ class WalkForwardTrainer:
             candidate_params=candidate_params,
             model_identity=model_identity,
         )
+        artifact_directory = oof_artifact_directory or "/tmp/trade-ml-oof"
+        oof_artifact_path = OOFAnalyzer.persist_records(
+            oof_records,
+            output_directory=artifact_directory,
+            dataset_fingerprint=dataset_fingerprint,
+            walk_forward_fingerprint=fingerprint,
+        )
+        oof_analysis_result = OOFAnalyzer.analyze(
+            records=oof_records,
+            development_rows=development_rows,
+            trading_style=trading_style,
+            locked_test_start=reservation["lockedTest"]["startTime"],
+            confidence_thresholds=getattr(oof_analysis, "confidenceThresholds", None),
+            margin_thresholds=getattr(oof_analysis, "marginThresholds", None),
+            combined_thresholds=(
+                [item.model_dump() if hasattr(item, "model_dump") else item for item in oof_analysis.combinedThresholds]
+                if oof_analysis is not None
+                else None
+            ),
+            costs={
+                "brokerage": float(getattr(oof_analysis, "brokerage", 0.0)),
+                "transactionCostPct": float(getattr(oof_analysis, "transactionCostPct", 0.0)),
+                "slippagePct": float(getattr(oof_analysis, "slippagePct", 0.0)),
+                "sttPct": float(getattr(oof_analysis, "sttPct", 0.0)),
+                "exchangeFeePct": float(getattr(oof_analysis, "exchangeFeePct", 0.0)),
+            },
+            capital_per_trade=float(getattr(oof_analysis, "capitalPerTrade", 100000.0)),
+            minimum_trade_count=int(getattr(oof_analysis, "minimumTradeCount", 30)),
+            maximum_drawdown_pct=float(getattr(oof_analysis, "maximumDrawdownPct", 25.0)),
+            prediction_artifact_path=str(oof_artifact_path),
+        )
         coverage = {
             "initialTrainingSessions": int(initial_training_sessions),
             "validationSessionsPerFold": int(config.validationWindowSessions),
@@ -616,6 +661,7 @@ class WalkForwardTrainer:
             "rowReconciliationValid": reservation["rowReconciliationValid"],
             "walkForwardCoverage": coverage,
             "walkForwardFingerprint": fingerprint,
+            "outOfFold": oof_analysis_result,
             "foldCount": len(fold_results),
             "folds": fold_results,
             "aggregate": aggregate,
