@@ -219,7 +219,16 @@ This service currently provides:
 - price features
 - volume features
 - technical transforms from existing Java indicator values
+- EMA trend, momentum, volatility, and market-structure features
+- session time and price-versus-VWAP features
+- five-minute, fifteen-minute, and one-hour indicators
 - candle pattern flags
+
+Feature schema v3 is included in dataset fingerprints. Higher-timeframe values are calculated from complete source-candle buckets and backward-aligned to each prediction candle's close time; incomplete current buckets are not visible until their final source candle has closed. Intraday session features use a 09:15 market open. Numeric market, volatility, and trend regime features are derived only from trailing price/volatility history.
+
+## Model diagnostics
+
+`POST /api/v1/model/evaluate-targets` evaluates configurations A-D with four expanding, session-aligned, purged walk-forward folds. It reports per-fold regime and label summaries, validation-only gain/weight/permutation importance, sigmoid-versus-isotonic calibration, confidence-threshold signal quality, and cost-aware OOF backtests. Non-zero default costs are brokerage 20, transaction 0.01%, slippage 0.02%, exchange fees 0.003%, and STT 0.025%. The locked test is evaluated once only if a candidate passes validation gates; otherwise it remains unevaluated.
 
 ## Label generation
 
@@ -235,6 +244,7 @@ The implementation explicitly prevents leakage by:
 
 - only using past/historical data when engineering features
 - never allowing future candles into the feature matrix
+- only joining higher-timeframe indicators whose complete candles have closed by the prediction timestamp
 - excluding target columns from model features
 - requiring explicit feature selection rather than using all numeric columns
 

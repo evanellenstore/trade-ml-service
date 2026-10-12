@@ -11,7 +11,7 @@ class ModelMetadata:
     predictionHorizonBars: int
     buyThresholdPct: float
     sellThresholdPct: float
-    featureVersion: str = "v1"
+    featureVersion: str = "v3"
     algorithm: str = "pending"
     trainingStartTime: datetime | None = None
     trainingEndTime: datetime | None = None

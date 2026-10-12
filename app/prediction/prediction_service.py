@@ -102,12 +102,20 @@ class PredictionService:
             timeframe,
             start_time,
             end_time,
+            include_source_candles=True,
         )
         if market_data.data.empty:
             raise ValueError("No market data found for live prediction")
 
-        latest = market_data.data.sort_values("candle_time").iloc[[-1]].copy()
-        feature_matrix = self.feature_matrix(latest)
+        market_rows = market_data.data.sort_values("candle_time").copy()
+        engineered_rows = self.feature_engineering.transform(
+            market_rows,
+            market_data.source_data,
+        )
+        feature_matrix = self.feature_engineering.feature_matrix(
+            engineered_rows.iloc[[-1]],
+        )
+        latest = market_rows.iloc[[-1]].copy()
         probabilities = self.model.predict_proba(feature_matrix)[0]
         prediction = self._decode_prediction(self.model.predict(feature_matrix)[0])
         return {

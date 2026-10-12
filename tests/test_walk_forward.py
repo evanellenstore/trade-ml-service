@@ -10,6 +10,7 @@ from app.schemas.model_schema import ModelTrainRequest, ValidationStrategy, Walk
 from app.training.walk_forward import WalkForwardConfig as WalkForwardSpec
 from app.training.walk_forward import WalkForwardSplitter, WalkForwardTrainer
 from app.training.oof_analysis import OOFAnalyzer
+from app.training.experiment_runner import DEFAULT_EXPERIMENTS
 
 
 def _synthetic_rows(*, session_count: int = 360, rows_per_session: int = 5) -> pd.DataFrame:
@@ -64,8 +65,25 @@ def test_model_train_request_accepts_walk_forward_strategy() -> None:
     assert payload.validationStrategy == ValidationStrategy.WALK_FORWARD
     assert payload.walkForward is not None
     assert payload.walkForward.foldCount == 4
-    assert payload.oofAnalysis.confidenceThresholds == [0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
+    assert payload.oofAnalysis.confidenceThresholds == [0.40, 0.45, 0.50, 0.55, 0.60]
+    assert payload.oofAnalysis.brokerage == 20.0
+    assert payload.oofAnalysis.transactionCostPct == 0.01
+    assert payload.oofAnalysis.slippagePct == 0.02
+    assert payload.oofAnalysis.exchangeFeePct == 0.003
+    assert payload.oofAnalysis.sttPct == 0.025
     assert payload.oofAnalysis.marginThresholds == [0.05, 0.10, 0.15, 0.20, 0.25]
+
+
+def test_default_target_sweep_matches_requested_configurations() -> None:
+    assert [
+        (item["predictionHorizonBars"], item["buyThresholdPct"], item["sellThresholdPct"])
+        for item in DEFAULT_EXPERIMENTS
+    ] == [
+        (20, 0.10, -0.10),
+        (30, 0.20, -0.20),
+        (45, 0.25, -0.25),
+        (60, 0.30, -0.30),
+    ]
 
 
 def test_walk_forward_splitter_generates_non_overlapping_validation_windows() -> None:

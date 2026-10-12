@@ -3,10 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import math
 import time
 from datetime import datetime
 
+import numpy as np
 import pandas as pd
 
 from app.dataset.label_generator import LabelGenerator
@@ -45,14 +45,20 @@ class DatasetGenerator:
 
         # The provider keeps ONE_MINUTE on the existing database-indicator path
         # and prepares higher-timeframe candles and indicators in memory.
-        market_data = self.market_data_provider.get_market_data(symbol_token, timeframe, start_time, end_time)
+        market_data = self.market_data_provider.get_market_data(
+            symbol_token,
+            timeframe,
+            start_time,
+            end_time,
+            include_source_candles=True,
+        )
         source_df = market_data.data
 
         if source_df.empty:
             raise ValueError("No market data found for the requested symbol and timeframe")
 
         source_df = self._validate_and_order(source_df)
-        feature_df = self.feature_engineering.transform(source_df)
+        feature_df = self.feature_engineering.transform(source_df, market_data.source_data)
 
         # Calculate targets before filtering feature warm-up rows so the
         # horizon always refers to actual market bars in the requested timeframe.
@@ -65,7 +71,7 @@ class DatasetGenerator:
         )
 
         # Filter out rows with incomplete features or invalid targets. The final
-        # dataset is guaranteed to have all declared v1 features and valid labels.
+        # dataset is guaranteed to have all declared v3 features and valid labels.
         cleaned_df, filtering_diagnostics = self._finalize_dataset(labeled_df)
         self.supervised_rows = cleaned_df
 
@@ -131,7 +137,24 @@ class DatasetGenerator:
             datasetFingerprint=dataset_fingerprint,
         )
 
-        logger.info("Dataset generation complete: symbolToken=%s tradingStyle=%s timeframe=%s predictionHorizonBars=%s sourceRowCount=%s featureCount=%s warmupRowsRemoved=%s invalidRowsRemoved=%s finalDatasetCount=%s BUY=%s HOLD=%s SELL=%s executionTime=%.2fs",symbol_token,normalized_style.value,timeframe,prediction_horizon_bars,len(source_df),len(self.FEATURE_COLUMNS),filtering_diagnostics["feature_invalid_rows"],filtering_diagnostics["target_skipped_rows"],len(cleaned_df),label_distribution["BUY"],label_distribution["HOLD"],label_distribution["SELL"],time.time() - started_at)
+        logger.info(
+            "Dataset generation complete: symbolToken=%s tradingStyle=%s timeframe=%s predictionHorizonBars=%s sourceRowCount=%s featureCount=%s featureWarmupRows=%s featureInternalInvalidRows=%s featureInvalidRows=%s targetSkippedRows=%s finalDatasetCount=%s BUY=%s HOLD=%s SELL=%s executionTime=%.2fs",
+            symbol_token,
+            normalized_style.value,
+            timeframe,
+            prediction_horizon_bars,
+            len(source_df),
+            len(self.FEATURE_COLUMNS),
+            filtering_diagnostics["feature_warmup_rows"],
+            filtering_diagnostics["feature_internal_invalid_rows"],
+            filtering_diagnostics["feature_invalid_rows"],
+            filtering_diagnostics["target_skipped_rows"],
+            len(cleaned_df),
+            label_distribution["BUY"],
+            label_distribution["HOLD"],
+            label_distribution["SELL"],
+            time.time() - started_at,
+        )
         return summary
 
     def _validate_and_order(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -152,7 +175,7 @@ class DatasetGenerator:
         return df
 
     def _finalize_dataset(self, df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
-        """Select rows with both complete v1 features and valid targets.
+        """Select rows with both complete v3 features and valid targets.
 
         Target columns are created before this method so removing feature
         warm-up rows cannot change bar-distance semantics. Final rows are
@@ -169,9 +192,13 @@ class DatasetGenerator:
         if missing_features:
             raise ValueError(f"Dataset missing required feature columns: {missing_features}")
 
-        # Readiness is based only on the declared v1 model inputs. Auxiliary
+        # Readiness is based only on the declared v3 model inputs. Auxiliary
         # indicator or metadata columns must not remove otherwise valid rows.
         feature_ready_mask = self._finite_columns_mask(df, feature_columns)
+        feature_warmup_mask, feature_internal_invalid_mask = self._feature_invalid_masks(
+            df,
+            feature_columns,
+        )
         indicator_feature_columns = [
             column
             for column in feature_columns
@@ -206,6 +233,8 @@ class DatasetGenerator:
         diagnostics = {
             "indicator_warmup_rows": int(indicator_warmup_mask.sum()),
             "feature_invalid_rows": int((~feature_ready_mask).sum()),
+            "feature_warmup_rows": int(feature_warmup_mask.sum()),
+            "feature_internal_invalid_rows": int(feature_internal_invalid_mask.sum()),
             "target_skipped_rows": int((~target_valid_mask).sum()),
             "overlap_warmup_and_target_skipped_rows": int(
                 ((~feature_ready_mask) & (~target_valid_mask)).sum()
@@ -234,8 +263,8 @@ class DatasetGenerator:
     def _label_rows(self, df: pd.DataFrame, buy_threshold_pct: float, sell_threshold_pct: float) -> pd.DataFrame:
         result = df.copy()
         result["label"] = "HOLD"
-        result.loc[result["future_return_pct"] >= buy_threshold_pct, "label"] = "BUY"
-        result.loc[result["future_return_pct"] <= sell_threshold_pct, "label"] = "SELL"
+        result.loc[result["future_return_pct"] > buy_threshold_pct, "label"] = "BUY"
+        result.loc[result["future_return_pct"] < sell_threshold_pct, "label"] = "SELL"
         return result
 
     def _primary_skip_reasons(
@@ -267,7 +296,7 @@ class DatasetGenerator:
             "insufficientFutureBars": int(insufficient_rows.sum()),
         }
 
-    def _feature_validation(self, df: pd.DataFrame) -> dict[str, int]:
+    def _feature_validation(self, df: pd.DataFrame) -> dict[str, object]:
         feature_columns = list(self.FEATURE_COLUMNS)
         if not feature_columns:
             return {
@@ -279,22 +308,46 @@ class DatasetGenerator:
             }
         available = [column for column in feature_columns if column in df.columns]
         values = df[available]
-        null_value_count = int(
-            values.apply(
-                lambda column: column.map(
-                    lambda value: value is None or value is pd.NA
-                )
-            ).sum().sum()
-        )
-        nan_value_count = int(
-            values.apply(
-                lambda column: column.map(
-                    lambda value: isinstance(value, float) and math.isnan(value)
-                )
-            ).sum().sum()
-        )
+        null_mask = values.apply(lambda column: column.map(lambda value: value is None or value is pd.NA))
+        null_value_count = int(null_mask.sum().sum())
+        nan_value_count = int((values.isna() & ~null_mask).sum().sum())
         positive_infinity_count = int((values == float("inf")).sum().sum())
         negative_infinity_count = int((values == float("-inf")).sum().sum())
+        per_feature: dict[str, dict[str, int | str | None]] = {}
+        for column in self.FEATURE_COLUMNS:
+            if column not in df.columns:
+                per_feature[column] = {
+                    "invalidValueCount": len(df),
+                    "invalidRowCount": len(df),
+                    "nanValueCount": len(df),
+                    "positiveInfinityCount": 0,
+                    "negativeInfinityCount": 0,
+                    "warmupRowCount": len(df),
+                    "internalInvalidRowCount": 0,
+                    "firstValidTimestamp": None,
+                }
+                continue
+            column_values = df[column]
+            invalid = column_values.isna()
+            if pd.api.types.is_numeric_dtype(column_values):
+                invalid |= ~np.isfinite(pd.to_numeric(column_values, errors="coerce"))
+            warmup_rows, internal_rows = self._feature_invalid_masks(df, [column])
+            valid_values = ~invalid
+            first_valid_timestamp = None
+            if valid_values.any() and "candle_time" in df.columns:
+                first_valid_timestamp = pd.Timestamp(
+                    df.loc[valid_values, "candle_time"].min()
+                ).isoformat()
+            per_feature[column] = {
+                "invalidValueCount": int(invalid.sum()),
+                "invalidRowCount": int(invalid.sum()),
+                "nanValueCount": int(column_values.isna().sum()),
+                "positiveInfinityCount": int((column_values == float("inf")).sum()),
+                "negativeInfinityCount": int((column_values == float("-inf")).sum()),
+                "warmupRowCount": int(warmup_rows.sum()),
+                "internalInvalidRowCount": int(internal_rows.sum()),
+                "firstValidTimestamp": first_valid_timestamp,
+            }
         invalid_rows = (
             values.isna().any(axis=1)
             | (values.eq(float("inf")) | values.eq(float("-inf"))).any(axis=1)
@@ -305,7 +358,114 @@ class DatasetGenerator:
             "nanValueCount": nan_value_count,
             "positiveInfinityCount": positive_infinity_count,
             "negativeInfinityCount": negative_infinity_count,
+            "perFeature": per_feature,
         }
+
+    @staticmethod
+    def _feature_warmup_requirement(column: str, df: pd.DataFrame) -> str:
+        requirements = {
+            "five_min_rsi": "15 complete 5-minute candles (14 price changes)",
+            "five_min_macd": "26 complete 5-minute candles",
+            "fifteen_min_rsi": "15 complete 15-minute candles (14 price changes)",
+            "fifteen_min_macd": "26 complete 15-minute candles",
+            "one_hour_trend": "20 complete 1-hour candles",
+            "ema20_slope": "21 closes for a local 20-period EMA plus prior EMA; one prior value when source EMA is supplied",
+            "ema50_slope": "51 closes for a local 50-period EMA plus prior EMA; one prior value when source EMA is supplied",
+            "ema200_slope": "201 closes for a local 200-period EMA plus prior EMA; one prior value when source EMA is supplied",
+            "price_above_ema20": "20 EMA values; source trend_ema20 used when supplied",
+            "price_above_ema50": "50 EMA values; source trend_ema50 used when supplied",
+            "price_above_ema200": "200 EMA values; source trend_ema200 used when supplied",
+            "atr_ratio_short_long": "20 true-range observations",
+            "volatility_expansion": "21 closes for 20 one-bar returns",
+            "rolling_std_5": "6 closes for 5 one-bar returns",
+            "rolling_std_20": "21 closes for 20 one-bar returns",
+            "rsi_change_3": "3 rows after the first usable RSI value",
+            "rsi_change_5": "5 rows after the first usable RSI value",
+            "macd_change": "1 row after the first usable MACD value",
+            "momentum_3": "4 closes",
+            "momentum_5": "6 closes",
+            "momentum_10": "11 closes",
+        }
+        requirement = requirements.get(column, "No rolling warm-up expected")
+        return requirement
+
+    @staticmethod
+    def _feature_required_observations(column: str, df: pd.DataFrame) -> int | None:
+        ema_periods = {"ema20_slope": 20, "ema50_slope": 50, "ema200_slope": 200}
+        if column in ema_periods:
+            return 2 if f"trend_ema{ema_periods[column]}" in df.columns else ema_periods[column] + 1
+        price_ema_periods = {
+            "price_above_ema20": 20,
+            "price_above_ema50": 50,
+            "price_above_ema200": 200,
+        }
+        if column in price_ema_periods:
+            period = price_ema_periods[column]
+            return 1 if f"trend_ema{period}" in df.columns else period
+        requirements = {
+            "five_min_rsi": 15,
+            "five_min_macd": 26,
+            "fifteen_min_rsi": 15,
+            "fifteen_min_macd": 26,
+            "one_hour_trend": 20,
+            "ema20_slope": 21,
+            "ema50_slope": 51,
+            "ema200_slope": 201,
+            "price_above_ema20": 20,
+            "price_above_ema50": 50,
+            "price_above_ema200": 200,
+            "atr_ratio_short_long": 20,
+            "volatility_expansion": 21,
+            "rolling_std_5": 6,
+            "rolling_std_20": 21,
+            "rsi_change_3": 18,
+            "rsi_change_5": 20,
+            "macd_change": 27,
+            "momentum_3": 4,
+            "momentum_5": 6,
+            "momentum_10": 11,
+            "market_regime": 21,
+            "volatility_regime": 21,
+            "trend_regime": 50,
+        }
+        return requirements.get(column)
+
+    @classmethod
+    def _feature_invalid_masks(
+        cls,
+        df: pd.DataFrame,
+        feature_columns: list[str],
+    ) -> tuple[pd.Series, pd.Series]:
+        warmup_rows = pd.Series(False, index=df.index)
+        internal_invalid_rows = pd.Series(False, index=df.index)
+        group_columns = [column for column in ("symbol_token", "timeframe") if column in df.columns]
+        groups = df.groupby(group_columns, dropna=False, sort=False).indices.values() if group_columns else [np.arange(len(df))]
+
+        for column in feature_columns:
+            if column not in df.columns:
+                internal_invalid_rows[:] = True
+                continue
+            values = df[column]
+            invalid = values.isna()
+            if pd.api.types.is_numeric_dtype(values):
+                invalid |= ~np.isfinite(pd.to_numeric(values, errors="coerce"))
+            invalid_values = invalid.to_numpy(dtype=bool)
+            for positions in groups:
+                positions = np.asarray(positions, dtype=int)
+                if positions.size == 0:
+                    continue
+                group_invalid = invalid_values[positions]
+                valid_positions = np.flatnonzero(~group_invalid)
+                if valid_positions.size == 0:
+                    warmup_rows.iloc[positions] |= True
+                    continue
+                leading_end = int(valid_positions[0])
+                if leading_end:
+                    warmup_rows.iloc[positions[:leading_end]] |= True
+                if group_invalid[leading_end + 1 :].any():
+                    internal_positions = positions[leading_end + 1 :][group_invalid[leading_end + 1 :]]
+                    internal_invalid_rows.iloc[internal_positions] = True
+        return warmup_rows, internal_invalid_rows
 
     def _feature_validation_audit(
         self,
@@ -315,15 +475,34 @@ class DatasetGenerator:
     ) -> dict[str, object]:
         before = self._feature_validation(source_df)
         after = self._feature_validation(final_df)
-        feature_warmup_rows = 0
-        if all(column in source_df.columns for column in ["volume", "relative_volume", "rolling_volume_mean"]):
-            feature_warmup_rows = int(
-                source_df["relative_volume"].isna().mul(source_df["volume"].eq(0)).sum()
-            )
+        feature_warmup_rows = int(diagnostics.get("feature_warmup_rows", 0))
+        per_feature: dict[str, dict[str, int | str | None]] = {}
+        before_features = before.get("perFeature", {})
+        after_features = after.get("perFeature", {})
+        for column in self.FEATURE_COLUMNS:
+            before_item = before_features.get(column, {})
+            after_item = after_features.get(column, {})
+            per_feature[column] = {
+                "invalidValueCount": int(before_item.get("invalidValueCount", 0)),
+                "invalidRowCount": int(before_item.get("invalidRowCount", 0)),
+                "nanValueCount": int(before_item.get("nanValueCount", 0)),
+                "positiveInfinityCount": int(before_item.get("positiveInfinityCount", 0)),
+                "negativeInfinityCount": int(before_item.get("negativeInfinityCount", 0)),
+                "warmupRowCount": int(before_item.get("warmupRowCount", 0)),
+                "internalInvalidRowCount": int(before_item.get("internalInvalidRowCount", 0)),
+                "afterFilteringInvalidValueCount": int(after_item.get("invalidValueCount", 0)),
+                "afterFilteringInvalidRowCount": int(after_item.get("invalidRowCount", 0)),
+                "afterFilteringNanValueCount": int(after_item.get("nanValueCount", 0)),
+                "warmupRequirement": self._feature_warmup_requirement(column, source_df),
+                "requiredLookbackObservations": self._feature_required_observations(column, source_df),
+                "firstValidTimestamp": before_item.get("firstValidTimestamp"),
+            }
         return {
             "beforeFiltering": before,
             "afterFiltering": after,
             "featureWarmupRows": feature_warmup_rows,
+            "featureInternalInvalidRows": int(diagnostics.get("feature_internal_invalid_rows", 0)),
+            "perFeature": per_feature,
         }
 
     @staticmethod

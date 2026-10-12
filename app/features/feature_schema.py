@@ -4,7 +4,7 @@ from __future__ import annotations
 class FeatureSchema:
     """Canonical model feature contract used for generation and prediction."""
 
-    version = "v1"
+    version = "v3"
     columns = [
         "return_1",
         "return_5",
@@ -32,6 +32,38 @@ class FeatureSchema:
         "is_shooting_star",
         "is_bullish_engulfing",
         "is_bearish_engulfing",
+        "ema20_slope",
+        "ema50_slope",
+        "ema200_slope",
+        "price_above_ema20",
+        "price_above_ema50",
+        "price_above_ema200",
+        "price_above_vwap",
+        "rsi_change_3",
+        "rsi_change_5",
+        "macd_change",
+        "momentum_3",
+        "momentum_5",
+        "momentum_10",
+        "atr_ratio_short_long",
+        "volatility_expansion",
+        "rolling_std_5",
+        "rolling_std_20",
+        "distance_from_day_high",
+        "distance_from_day_low",
+        "breakout_day_high",
+        "breakout_day_low",
+        "minute_of_day",
+        "minute_from_open",
+        "session_progress_pct",
+        "five_min_rsi",
+        "five_min_macd",
+        "fifteen_min_rsi",
+        "fifteen_min_macd",
+        "one_hour_trend",
+        "market_regime",
+        "volatility_regime",
+        "trend_regime",
     ]
 
     @classmethod
@@ -44,3 +76,4 @@ class FeatureSchema:
 
 
 FEATURE_SCHEMA = FeatureSchema()
+FEATURE_COUNT = len(FEATURE_SCHEMA.columns)

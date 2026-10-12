@@ -5,31 +5,38 @@ import pandas as pd
 from app.features.candle_patterns import add_candle_pattern_features
 from app.features.feature_leakage import FeatureLeakageValidator
 from app.features.feature_schema import FEATURE_SCHEMA
+from app.features.intraday_features import add_intraday_features
 from app.features.price_features import add_price_features
 from app.features.technical_features import add_technical_features
 from app.features.volume_features import add_volume_features
 
 
 class FeatureEngineering:
-    def transform(self, df: pd.DataFrame) -> pd.DataFrame:
+    def transform(
+        self,
+        df: pd.DataFrame,
+        source_candles: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
         """Apply the single reusable feature pipeline for both historical and live use."""
         result = df.copy()
         result = add_price_features(result)
         result = add_volume_features(result)
         result = add_technical_features(result)
         result = add_candle_pattern_features(result)
+        result = add_intraday_features(result, source_candles)
         return result
 
     def feature_matrix(
         self,
         df: pd.DataFrame,
         require_finite: bool = True,
+        source_candles: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         """Return the exact canonical feature matrix used by training and prediction."""
         if all(column in df.columns for column in FEATURE_SCHEMA.columns):
             engineered = df.copy()
         else:
-            engineered = self.transform(df)
+            engineered = self.transform(df, source_candles)
         missing = [column for column in FEATURE_SCHEMA.columns if column not in engineered.columns]
         if missing:
             raise ValueError(f"Feature matrix missing columns: {missing}")

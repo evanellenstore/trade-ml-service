@@ -10,7 +10,7 @@ import pandas as pd
 from sklearn.metrics import log_loss
 from sklearn.preprocessing import LabelEncoder
 
-from app.features.feature_schema import FEATURE_SCHEMA
+from app.features.feature_schema import FEATURE_COUNT, FEATURE_SCHEMA
 from app.training.model_evaluator import ModelEvaluator
 
 try:
@@ -33,8 +33,8 @@ class LightGBMTrainer:
         df: pd.DataFrame,
         feature_columns: list[str],
     ) -> pd.DataFrame:
-        if len(feature_columns) != 26:
-            raise ValueError(f"feature count must be 26; received {len(feature_columns)}")
+        if len(feature_columns) != FEATURE_COUNT:
+            raise ValueError(f"feature count must be {FEATURE_COUNT}; received {len(feature_columns)}")
         if list(feature_columns) != list(FEATURE_SCHEMA.columns):
             raise ValueError("feature names or order do not match the canonical schema")
         X = df.loc[:, feature_columns].copy()
@@ -88,7 +88,13 @@ class LightGBMTrainer:
         validation_predictions_labels = label_encoder.inverse_transform(validation_predictions)
         probabilities = model.predict_proba(X_validation)
         metrics = ModelEvaluator.evaluate_predictions(y_validation, validation_predictions_labels, labels=list(label_encoder.classes_))
-        metrics["logLoss"] = float(log_loss(y_validation, probabilities, labels=list(label_encoder.classes_)))
+        metrics["logLoss"] = float(
+            ModelEvaluator.log_loss_metrics(
+                y_validation,
+                probabilities,
+                labels=list(label_encoder.classes_),
+            )
+        )
         self.model_path.parent.mkdir(parents=True, exist_ok=True)
         joblib.dump(model, self.model_path)
         metadata_path = self.model_path.with_suffix(self.model_path.suffix + ".metadata.json")

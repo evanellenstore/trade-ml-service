@@ -13,7 +13,7 @@ from app.features.feature_schema import FeatureSchema
 from app.schemas.dataset_schema import DatasetSummary
 
 
-def test_feature_schema_is_central_and_exactly_26_columns():
+def test_feature_schema_is_central_and_includes_v3_features():
     expected = [
         "return_1",
         "return_5",
@@ -41,9 +41,41 @@ def test_feature_schema_is_central_and_exactly_26_columns():
         "is_shooting_star",
         "is_bullish_engulfing",
         "is_bearish_engulfing",
+        "ema20_slope",
+        "ema50_slope",
+        "ema200_slope",
+        "price_above_ema20",
+        "price_above_ema50",
+        "price_above_ema200",
+        "price_above_vwap",
+        "rsi_change_3",
+        "rsi_change_5",
+        "macd_change",
+        "momentum_3",
+        "momentum_5",
+        "momentum_10",
+        "atr_ratio_short_long",
+        "volatility_expansion",
+        "rolling_std_5",
+        "rolling_std_20",
+        "distance_from_day_high",
+        "distance_from_day_low",
+        "breakout_day_high",
+        "breakout_day_low",
+        "minute_of_day",
+        "minute_from_open",
+        "session_progress_pct",
+        "five_min_rsi",
+        "five_min_macd",
+        "fifteen_min_rsi",
+        "fifteen_min_macd",
+        "one_hour_trend",
+        "market_regime",
+        "volatility_regime",
+        "trend_regime",
     ]
 
-    assert FeatureSchema.version == "v1"
+    assert FeatureSchema.version == "v3"
     assert FeatureSchema.columns == expected
     assert DatasetGenerator.FEATURE_COLUMNS == expected
     assert all(name not in expected for name in {"future_close", "future_return_pct", "label"})
@@ -70,7 +102,7 @@ def test_dataset_fingerprint_is_stable_and_canonical():
         prediction_horizon_bars=30,
         buy_threshold_pct=0.15,
         sell_threshold_pct=-0.15,
-        feature_version="v1",
+        feature_version="v3",
         feature_columns=FeatureSchema.columns,
         dataset_start_time="2026-01-01T00:00:00",
         dataset_end_time="2026-01-01T00:05:00",
@@ -83,7 +115,7 @@ def test_dataset_fingerprint_is_stable_and_canonical():
         prediction_horizon_bars=30,
         buy_threshold_pct=0.15,
         sell_threshold_pct=-0.15,
-        feature_version="v1",
+        feature_version="v3",
         feature_columns=FeatureSchema.columns,
         dataset_start_time="2026-01-01T00:00:00",
         dataset_end_time="2026-01-01T00:05:00",
@@ -95,7 +127,7 @@ def test_dataset_fingerprint_is_stable_and_canonical():
     assert first == hashlib.sha256(first.encode("utf-8")).hexdigest() or len(first) == 64
 
 
-def test_label_thresholds_preserve_equality_semantics():
+def test_label_thresholds_keep_exact_boundary_returns_in_hold():
     frame = pd.DataFrame(
         {
             "future_return_pct": [0.15, -0.15, 0.1],
@@ -104,7 +136,7 @@ def test_label_thresholds_preserve_equality_semantics():
     )
 
     labeled = DatasetGenerator()._label_rows(frame, 0.15, -0.15)
-    assert labeled["label"].tolist() == ["BUY", "SELL", "HOLD"]
+    assert labeled["label"].tolist() == ["HOLD", "HOLD", "HOLD"]
 
 
 def test_primary_skip_reasons_reconcile_with_skipped_row_count():
@@ -163,10 +195,10 @@ def test_summary_model_accepts_new_audit_fields():
         sourceRowCount=2,
         datasetRowCount=1,
         skippedRowCount=1,
-        featureCount=26,
-        featureVersion="v1",
+        featureCount=len(FeatureSchema.columns),
+        featureVersion="v3",
         labelDistribution={"BUY": 1, "HOLD": 0, "SELL": 0},
-        featureSchema={"version": "v1", "count": 26, "features": ["return_1"]},
+        featureSchema={"version": "v3", "count": len(FeatureSchema.columns), "features": ["return_1"]},
         skipReasons={"crossSessionHorizon": 1},
         trainingEligibility={"eligible": True, "reasons": []},
         featureValidation={
@@ -188,7 +220,7 @@ def test_summary_model_accepts_new_audit_fields():
         },
     )
 
-    assert summary.featureSchema.count == 26
+    assert summary.featureSchema.count == len(FeatureSchema.columns)
     assert summary.trainingEligibility.eligible is True
     assert summary.trainingEligibility.reasons == []
     assert summary.featureValidation.featureWarmupRows == 1

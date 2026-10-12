@@ -23,7 +23,12 @@ class FakeRepository:
 
 
 def raw_candles(count=40):
-    times = pd.date_range("2026-01-02 09:15", periods=count, freq="min")
+    times = []
+    for day in pd.date_range("2026-01-02", periods=(count // 375) + 2, freq="B"):
+        times.extend(pd.date_range(day + pd.Timedelta(hours=9, minutes=15), periods=375, freq="min"))
+        if len(times) >= count:
+            break
+    times = times[:count]
     opens = [100 + value for value in range(count)]
     return pd.DataFrame(
         {
@@ -62,6 +67,20 @@ def test_one_minute_provider_preserves_existing_joined_indicator_path():
     pd.testing.assert_frame_equal(result.data, joined)
 
 
+def test_one_minute_provider_fetches_source_candles_when_requested():
+    joined = raw_candles(2)
+    repository = FakeRepository(raw_candles(10), joined)
+
+    result = MarketDataProvider(repository=repository).get_market_data(
+        "A",
+        "ONE_MINUTE",
+        include_source_candles=True,
+    )
+
+    assert repository.raw_calls == 1
+    assert result.source_data is repository.raw
+
+
 def test_indicator_calculator_only_uses_resampled_frame():
     frame = raw_candles(40)
     frame["timeframe"] = "FIVE_MINUTE"
@@ -71,8 +90,8 @@ def test_indicator_calculator_only_uses_resampled_frame():
     assert "momentum_rsi14" not in frame.columns
 
 
-def test_five_minute_generator_and_analyzer_have_matching_target_counts():
-    repository = FakeRepository(raw_candles(20), pd.DataFrame())
+def test_five_minute_feature_warmup_is_independent_of_target_analysis_counts():
+    repository = FakeRepository(raw_candles(6000), pd.DataFrame())
     generator = DatasetGenerator()
     generator.market_data_provider = MarketDataProvider(repository=repository)
 
@@ -91,9 +110,6 @@ def test_five_minute_generator_and_analyzer_have_matching_target_counts():
     )
     threshold = analysis.analysis[0].thresholdAnalysis[0]
 
-    assert summary.datasetRowCount == analysis.analysis[0].validTargetRows
-    assert summary.labelDistribution == {
-        "BUY": threshold.buy.count,
-        "HOLD": threshold.hold.count,
-        "SELL": threshold.sell.count,
-    }
+    assert summary.datasetRowCount < analysis.analysis[0].validTargetRows
+    assert sum(summary.labelDistribution.values()) == summary.datasetRowCount
+    assert summary.datasetRowCount <= threshold.buy.count + threshold.hold.count + threshold.sell.count

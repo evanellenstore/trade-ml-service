@@ -14,6 +14,7 @@ from app.dataset.split.purged_chronological_dataset_splitter import PurgedChrono
 from app.features.feature_schema import FEATURE_SCHEMA
 from app.training.model_evaluator import ModelEvaluator
 from app.training.oof_analysis import OOFAnalyzer
+from app.training.probability_calibration import ProbabilityCalibrationEvaluator
 from app.training.xgboost_trainer import XGBoostTrainer
 
 
@@ -367,6 +368,30 @@ class WalkForwardEvaluator:
             "worstFold": 0,
         }
 
+    @staticmethod
+    def regime_summary(rows: pd.DataFrame) -> dict[str, Any]:
+        numeric_columns = {
+            "averageVolatility": "rolling_std_20",
+            "averageAtrPct": "atr_pct",
+            "averageVolume": "volume",
+            "averageReturn1": "return_1",
+        }
+        summary: dict[str, Any] = {}
+        for output, column in numeric_columns.items():
+            values = pd.to_numeric(rows[column], errors="coerce") if column in rows.columns else pd.Series(dtype=float)
+            summary[output] = float(values.mean()) if values.notna().any() else None
+
+        for name in ("market_regime", "volatility_regime", "trend_regime"):
+            if name in rows.columns:
+                distribution = rows[name].value_counts(normalize=True, dropna=False)
+                summary[name] = {str(key): float(value) for key, value in distribution.items()}
+            else:
+                summary[name] = {}
+        labels = rows["label"].astype(str).value_counts(normalize=True) if "label" in rows.columns else pd.Series(dtype=float)
+        summary["labelDistributionPct"] = {str(key): float(value) for key, value in labels.items()}
+        summary["rowCount"] = int(len(rows))
+        return summary
+
 
 class WalkForwardTrainer:
     """Evaluate a candidate configuration across walk-forward folds and select the most stable model."""
@@ -474,9 +499,35 @@ class WalkForwardTrainer:
                 hyperparameters=trial_params,
                 label_order=["SELL", "HOLD", "BUY"],
             )
+            calibration_model, calibrated_probabilities, calibration_report = ProbabilityCalibrationEvaluator().fit_select(
+                fit_result["trainedModel"],
+                X_train,
+                y_train,
+                X_validation,
+                y_validation,
+                gap_bars=prediction_horizon_bars,
+            )
+            if calibration_model is not None and calibrated_probabilities is not None:
+                fit_result["trainedModel"] = calibration_model
+                fit_result["probabilities"] = calibrated_probabilities
+            validation_features = X_validation
+            importance_model = fit_result["trainedModel"]
+            if ModelEvaluator.has_tree_importance(importance_model):
+                feature_importance = ModelEvaluator.feature_importance_report(
+                    importance_model,
+                    feature_columns,
+                    validation_features,
+                    y_validation,
+                    permutation_repeats=3,
+                )
+            else:
+                feature_importance = {"ranking": [], "top10": [], "bottom10": [], "belowMinimumImportance": []}
             probabilities = np.asarray(fit_result["probabilities"], dtype=float)
-            validation_predictions = np.asarray(fit_result["trainedModel"].predict(X_validation), dtype=int)
-            validation_predictions_labels = trainer._decode_canonical_labels(validation_predictions)
+            validation_predictions = np.asarray(fit_result["trainedModel"].predict(X_validation))
+            if np.issubdtype(validation_predictions.dtype, np.number):
+                validation_predictions_labels = trainer._decode_canonical_labels(validation_predictions.astype(int))
+            else:
+                validation_predictions_labels = validation_predictions.astype(str)
             if len(y_validation) != len(validation_predictions_labels):
                 raise ValueError("Validation prediction count does not match validation rows")
             if probabilities.shape[1] != 3:
@@ -514,6 +565,7 @@ class WalkForwardTrainer:
                 "purgedRows": fold["purge"]["purgedRows"],
                 "embargoedRows": 0,
                 "labelDistribution": {"BUY": int((y_validation == "BUY").sum()), "HOLD": int((y_validation == "HOLD").sum()), "SELL": int((y_validation == "SELL").sum())},
+                "marketRegime": WalkForwardEvaluator.regime_summary(validation_df),
                 "metrics": {
                     "accuracy": float(metrics["accuracy"]),
                     "balancedAccuracy": float(metrics["balancedAccuracy"]),
@@ -523,6 +575,8 @@ class WalkForwardTrainer:
                     "weightedF1": float(metrics["weightedF1"]),
                     "logLoss": float(metrics["logLoss"]),
                 },
+                "featureImportance": feature_importance,
+                "probabilityCalibration": calibration_report,
                 "classMetrics": {
                     "SELL": {
                         "precision": float(class_metrics.get("SELL", {}).get("precision", 0.0)),
@@ -554,6 +608,55 @@ class WalkForwardTrainer:
             fold_results.append(fold_result)
 
         aggregate = WalkForwardEvaluator.aggregate(fold_results)
+        importance_by_feature: dict[str, list[float]] = {column: [] for column in feature_columns}
+        for fold in fold_results:
+            for item in fold["featureImportance"]["ranking"]:
+                importance_by_feature[item["feature"]].append(float(item["combinedImportancePct"]))
+        aggregate_importance = [
+            {
+                "feature": feature,
+                "combinedImportancePct": float(np.mean(values)) if values else 0.0,
+            }
+            for feature, values in importance_by_feature.items()
+        ]
+        aggregate_importance.sort(key=lambda item: item["combinedImportancePct"], reverse=True)
+        aggregate["featureImportance"] = {
+            "ranking": aggregate_importance,
+            "top10": aggregate_importance[:10],
+            "bottom10": aggregate_importance[-10:],
+            "belowMinimumImportance": [
+                item["feature"] for item in aggregate_importance if item["combinedImportancePct"] < 0.5
+            ],
+            "minimumImportancePct": 0.5,
+            "foldAveragedValidationOnly": True,
+        }
+        aggregate["probabilityCalibration"] = {
+            "folds": [fold["probabilityCalibration"] for fold in fold_results],
+            "selectedMethods": [fold["probabilityCalibration"].get("selectedMethod") for fold in fold_results],
+        }
+        if len(fold_results) > 1:
+            earlier_summaries = [fold["marketRegime"] for fold in fold_results[:-1]]
+            last_summary = fold_results[-1]["marketRegime"]
+            comparison: dict[str, Any] = {"lastFoldNumber": fold_results[-1]["foldNumber"]}
+            for field in ("averageVolatility", "averageAtrPct", "averageVolume", "averageReturn1"):
+                earlier_values = [summary[field] for summary in earlier_summaries if summary[field] is not None]
+                earlier_mean = float(np.mean(earlier_values)) if earlier_values else None
+                last_value = last_summary[field]
+                comparison[field] = {
+                    "previousFoldsMean": earlier_mean,
+                    "lastFold": last_value,
+                    "difference": float(last_value - earlier_mean) if last_value is not None and earlier_mean is not None else None,
+                }
+            for field in ("market_regime", "volatility_regime", "trend_regime", "labelDistributionPct"):
+                earlier_keys = set().union(*(set(summary[field]) for summary in earlier_summaries))
+                comparison[field] = {
+                    key: {
+                        "previousFoldsMean": float(np.mean([summary[field].get(key, 0.0) for summary in earlier_summaries])),
+                        "lastFold": float(last_summary[field].get(key, 0.0)),
+                    }
+                    for key in sorted(earlier_keys | set(last_summary[field]))
+                }
+            aggregate["lastFoldRegimeComparison"] = comparison
         aggregate["worstFold"] = min(
             range(len(fold_results)),
             key=lambda index: float(fold_results[index]["metrics"]["macroF1"]),
@@ -626,15 +729,18 @@ class WalkForwardTrainer:
                 else None
             ),
             costs={
-                "brokerage": float(getattr(oof_analysis, "brokerage", 0.0)),
-                "transactionCostPct": float(getattr(oof_analysis, "transactionCostPct", 0.0)),
-                "slippagePct": float(getattr(oof_analysis, "slippagePct", 0.0)),
-                "sttPct": float(getattr(oof_analysis, "sttPct", 0.0)),
-                "exchangeFeePct": float(getattr(oof_analysis, "exchangeFeePct", 0.0)),
+                "brokerage": float(getattr(oof_analysis, "brokerage", 20.0)),
+                "transactionCostPct": float(getattr(oof_analysis, "transactionCostPct", 0.01)),
+                "slippagePct": float(getattr(oof_analysis, "slippagePct", 0.02)),
+                "sttPct": float(getattr(oof_analysis, "sttPct", 0.025)),
+                "exchangeFeePct": float(getattr(oof_analysis, "exchangeFeePct", 0.003)),
             },
             capital_per_trade=float(getattr(oof_analysis, "capitalPerTrade", 100000.0)),
-            minimum_trade_count=int(getattr(oof_analysis, "minimumTradeCount", 30)),
-            maximum_drawdown_pct=float(getattr(oof_analysis, "maximumDrawdownPct", 25.0)),
+            minimum_trade_count=int(getattr(oof_analysis, "minimumTradeCount", 100)),
+            maximum_drawdown_pct=float(getattr(oof_analysis, "maximumDrawdownPct", 10.0)),
+            minimum_profit_factor=float(getattr(oof_analysis, "minimumProfitFactor", 1.5)),
+            minimum_balanced_accuracy=float(getattr(oof_analysis, "minimumBalancedAccuracy", 0.45)),
+            minimum_macro_f1=float(getattr(oof_analysis, "minimumMacroF1", 0.45)),
             prediction_artifact_path=str(oof_artifact_path),
         )
         coverage = {

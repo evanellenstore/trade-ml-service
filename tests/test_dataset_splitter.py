@@ -43,7 +43,7 @@ def _rows(
     return frame
 
 
-def test_splitter_is_deterministic_and_keeps_v1_features_unchanged() -> None:
+def test_splitter_is_deterministic_and_keeps_v3_features_unchanged() -> None:
     rows = _rows(count=30)
     config = DatasetSplitConfig(
         trainRatio=0.7,
@@ -66,7 +66,7 @@ def test_splitter_is_deterministic_and_keeps_v1_features_unchanged() -> None:
     assert first.train.startTime == second.train.startTime
     assert first.test.endTime == second.test.endTime
     assert first.train.featureSchemaValid is True
-    assert first.train.featureCount == 26
+    assert first.train.featureCount == len(FEATURE_SCHEMA.columns)
     assert first.train.features == list(FEATURE_SCHEMA.columns)
     assert first.validationChecks.noDuplicateRows is True
     assert first.validationChecks.chronologicalOrderValid is True
@@ -171,7 +171,7 @@ def test_generated_dataset_preserves_target_metadata_without_feature_schema_chan
         trading_style=TradingStyle.INTRADAY,
     )
 
-    assert summary.featureVersion == "v1"
-    assert summary.featureCount == 26
-    assert len(summary.featureSchema.features) == 26
+    assert summary.featureVersion == "v3"
+    assert summary.featureCount == len(FEATURE_SCHEMA.columns)
+    assert len(summary.featureSchema.features) == len(FEATURE_SCHEMA.columns)
     assert DatasetGenerator.FEATURE_COLUMNS == FEATURE_SCHEMA.columns

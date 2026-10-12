@@ -47,7 +47,7 @@ def test_future_returns_horizon_one_and_five_exclude_final_rows_without_mutation
 
 
 def test_threshold_boundaries_and_counts():
-    source = candles([100, 101, 100, 99, 99, 99])
+    source = candles([100, 101.1, 101.0, 100.5, 99.4, 99.4])
     result = TargetAnalysisService(FakeRepository(source)).analyze(
         "A", "ONE_MINUTE", [1], [1]
     )

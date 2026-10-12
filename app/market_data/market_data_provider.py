@@ -24,6 +24,7 @@ class MarketDataDiagnostics:
 class MarketDataResult:
     data: pd.DataFrame
     diagnostics: MarketDataDiagnostics
+    source_data: pd.DataFrame | None = None
 
 
 class MarketDataProvider:
@@ -51,12 +52,20 @@ class MarketDataProvider:
         self.indicator_warmup_bars = indicator_warmup_bars
 
     def get_market_data(self,symbol_token: str,timeframe: Timeframe | str,start_time: datetime | None = None,end_time: datetime | None = None,
+        include_source_candles: bool = False,
     ) -> MarketDataResult:
         normalized_timeframe = Timeframe.normalize(timeframe)
         repository = self._repository()
         if normalized_timeframe == Timeframe.ONE_MINUTE:
             data = repository.fetch_market_data(symbol_token, normalized_timeframe.value, start_time, end_time)
-            return MarketDataResult(data=data,diagnostics=MarketDataDiagnostics(source_timeframe=Timeframe.ONE_MINUTE.value,source_row_count=len(data),resampled_row_count=len(data),
+            source_start = start_time - timedelta(minutes=60 * self.indicator_warmup_bars) if start_time is not None else None
+            fetch_raw_candles = getattr(repository, "fetch_raw_candles", None)
+            raw = (
+                fetch_raw_candles(symbol_token, source_start, end_time)
+                if include_source_candles and fetch_raw_candles
+                else None
+            )
+            return MarketDataResult(data=data,source_data=raw,diagnostics=MarketDataDiagnostics(source_timeframe=Timeframe.ONE_MINUTE.value,source_row_count=len(data),resampled_row_count=len(data),
                     partial_candle_count=0,dropped_partial_candle_count=0,indicator_warmup_rows=0,
                 ),
             )
@@ -70,7 +79,7 @@ class MarketDataProvider:
         source_start = start_time
         
         if source_start is not None:
-            lookback_minutes = (definition.source_minutes or 1440) * self.indicator_warmup_bars
+            lookback_minutes = max((definition.source_minutes or 1440) * self.indicator_warmup_bars, 60 * self.indicator_warmup_bars)
             source_start = source_start - timedelta(minutes=lookback_minutes)
             
         # Fetch raw one-minute candles, resample to the requested timeframe, and calculate indicators.   
@@ -88,7 +97,7 @@ class MarketDataProvider:
             calculated = calculated.loc[calculated["candle_time"] >= pd.Timestamp(start_time)].copy()
         if end_time is not None:
             calculated = calculated.loc[calculated["candle_time"] <= pd.Timestamp(end_time)].copy()
-        return MarketDataResult(data=calculated.reset_index(drop=True),diagnostics=MarketDataDiagnostics(source_timeframe=Timeframe.ONE_MINUTE.value,source_row_count=len(raw),
+        return MarketDataResult(data=calculated.reset_index(drop=True),source_data=raw,diagnostics=MarketDataDiagnostics(source_timeframe=Timeframe.ONE_MINUTE.value,source_row_count=len(raw),
                 resampled_row_count=resampled.diagnostics.resampled_row_count,partial_candle_count=resampled.diagnostics.partial_candle_count,dropped_partial_candle_count=resampled.diagnostics.dropped_partial_candle_count,indicator_warmup_rows=warmup_rows,
             ),
         )

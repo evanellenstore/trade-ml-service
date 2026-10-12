@@ -14,3 +14,18 @@ def test_volume_feature():
     assert "rolling_volume_mean" in result.columns
     assert "relative_volume" in result.columns
     assert result["volume_change_pct"].iloc[0] == 0.0
+
+
+def test_zero_volume_has_zero_relative_volume_instead_of_internal_nan():
+    frame = pd.DataFrame(
+        {
+            "symbol_token": ["A"] * 3,
+            "timeframe": ["ONE_MINUTE"] * 3,
+            "volume": [100.0, 0.0, 100.0],
+        }
+    )
+
+    result = add_volume_features(frame)
+
+    assert result["relative_volume"].iloc[1] == 0.0
+    assert result["relative_volume"].notna().all()

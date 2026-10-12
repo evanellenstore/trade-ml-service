@@ -40,8 +40,8 @@ class LabelGenerator:
         )
 
         result["label"] = "HOLD"
-        result.loc[result["future_return_pct"] >= buy_threshold_pct, "label"] = "BUY"
-        result.loc[result["future_return_pct"] <= sell_threshold_pct, "label"] = "SELL"
+        result.loc[result["future_return_pct"] > buy_threshold_pct, "label"] = "BUY"
+        result.loc[result["future_return_pct"] < sell_threshold_pct, "label"] = "SELL"
         return result
 
     @staticmethod

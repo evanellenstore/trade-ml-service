@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import joblib
+import warnings
+from sklearn.linear_model import LogisticRegression
 
 import numpy as np
 import pandas as pd
@@ -9,7 +11,10 @@ from app.features.feature_schema import FEATURE_SCHEMA
 from app.prediction.prediction_service import PredictionService
 from app.training.lightgbm_trainer import LightGBMTrainer
 from app.training.model_evaluator import ModelEvaluator
-from app.training.xgboost_trainer import XGBoostTrainer
+from app.training.oof_analysis import OOFAnalyzer
+from app.training.probability_calibration import ProbabilityCalibrationEvaluator
+from app.training.scikit_learn_trainer import ScikitLearnTrainer
+from app.training.xgboost_trainer import CanonicalClassAdapter, XGBoostTrainer
 
 
 def _training_rows() -> pd.DataFrame:
@@ -23,6 +28,36 @@ def _training_rows() -> pd.DataFrame:
     for column in FEATURE_SCHEMA.columns:
         rows[column] = range(len(rows), 0, -1)
     return rows
+
+
+def test_trainers_accept_the_v3_canonical_feature_count() -> None:
+    rows = _training_rows()
+    feature_columns = list(FEATURE_SCHEMA.columns)
+
+    xgboost_matrix = XGBoostTrainer.validate_feature_matrix(rows, feature_columns)
+    lightgbm_matrix = LightGBMTrainer.validate_feature_matrix(rows, feature_columns)
+
+    assert xgboost_matrix.shape == (len(rows), len(feature_columns))
+    assert lightgbm_matrix.shape == (len(rows), len(feature_columns))
+
+
+def test_fold_class_adapter_restores_absent_class_probability_column() -> None:
+    class TwoClassEstimator:
+        classes_ = np.asarray([0, 1])
+
+        @staticmethod
+        def predict(matrix: pd.DataFrame) -> np.ndarray:
+            return np.asarray([0, 1][: len(matrix)])
+
+        @staticmethod
+        def predict_proba(matrix: pd.DataFrame) -> np.ndarray:
+            return np.tile([0.7, 0.3], (len(matrix), 1))
+
+    adapted = CanonicalClassAdapter(TwoClassEstimator(), ["SELL", "BUY"])
+    matrix = pd.DataFrame({"x": [1.0, 2.0]})
+
+    assert adapted.predict(matrix).tolist() == [0, 2]
+    assert adapted.predict_proba(matrix).tolist() == [[0.7, 0.0, 0.3], [0.7, 0.0, 0.3]]
 
 
 def test_trainer_fits_saves_and_returns_validation_metrics(tmp_path) -> None:
@@ -72,6 +107,118 @@ def test_model_evaluator_returns_majority_and_stratified_baseline_metrics() -> N
     assert stratified["baseline_type"] == "stratified"
     assert 0.0 <= majority["accuracy"] <= 1.0
     assert 0.0 <= stratified["accuracy"] <= 1.0
+
+
+def test_feature_importance_report_ranks_canonical_features() -> None:
+    class FakeBooster:
+        @staticmethod
+        def get_score(importance_type: str) -> dict[str, float]:
+            return {"f0": 2.0, "f1": 1.0} if importance_type == "gain" else {"f0": 4.0, "f1": 2.0}
+
+    class FakeClassifier:
+        @staticmethod
+        def get_booster() -> FakeBooster:
+            return FakeBooster()
+
+        @staticmethod
+        def predict(matrix: pd.DataFrame) -> np.ndarray:
+            return np.arange(len(matrix)) % 3
+
+    features = list(FEATURE_SCHEMA.columns)
+    matrix = pd.DataFrame({column: np.arange(30, dtype=float) for column in features})
+    labels = ["SELL", "HOLD", "BUY"] * 10
+
+    report = ModelEvaluator.feature_importance_report(
+        FakeClassifier(),
+        features,
+        matrix,
+        labels,
+        permutation_repeats=1,
+    )
+
+    assert len(report["ranking"]) == len(features)
+    assert len(report["top10"]) == 10
+    assert len(report["bottom10"]) == 10
+    assert report["ranking"][0]["feature"] == features[0]
+    assert report["validationOnly"] is True
+
+
+def test_chronological_calibration_compares_sigmoid_and_isotonic() -> None:
+    features = pd.DataFrame({"x": np.arange(300, dtype=float), "z": np.sin(np.arange(300, dtype=float))})
+    labels = pd.Series(["SELL", "HOLD", "BUY"] * 100)
+    estimator = LogisticRegression(max_iter=200)
+
+    calibrated, probabilities, report = ProbabilityCalibrationEvaluator(n_splits=2).fit_select(
+        estimator,
+        features.iloc[:240],
+        labels.iloc[:240],
+        features.iloc[240:],
+        labels.iloc[240:],
+        gap_bars=2,
+    )
+
+    assert report["status"] == "CALIBRATED"
+    assert report["selectedMethod"] in {"sigmoid", "isotonic"}
+    assert set(report["comparison"]) == {"sigmoid", "isotonic"}
+    assert probabilities is not None
+    assert probabilities.shape == (60, 3)
+    assert np.allclose(probabilities.sum(axis=1), 1.0)
+    assert "brierScore" in report["validationMetrics"]
+    assert calibrated is not None
+
+
+def test_model_evaluator_keeps_canonical_axis_for_single_class_folds() -> None:
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        metrics = ModelEvaluator.evaluate_predictions(
+            ["BUY", "BUY", "BUY"],
+            ["SELL", "BUY", "HOLD"],
+            labels=["SELL", "HOLD", "BUY"],
+        )
+
+    assert metrics["confusionMatrix"]["classOrder"] == ["SELL", "HOLD", "BUY"]
+    assert len(metrics["confusionMatrix"]["matrix"]) == 3
+    assert metrics["classMetrics"]["SELL"]["support"] == 0
+    assert metrics["classMetrics"]["BUY"]["support"] == 3
+    assert not captured
+
+
+def test_oof_metrics_are_warning_free_for_absent_classes() -> None:
+    selected = pd.DataFrame(
+        {
+            "actualLabel": ["BUY", "BUY"],
+            "predictedLabel": ["SELL", "BUY"],
+            "foldNumber": [1, 1],
+        }
+    )
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        metrics = OOFAnalyzer._classification_metrics(selected, total_count=2)
+        stability = OOFAnalyzer._fold_stability(selected)
+
+    assert metrics["metrics"]["balancedAccuracy"] == 0.5
+    assert stability["foldCount"] == 1
+    assert not captured
+
+
+def test_legacy_sklearn_report_is_warning_free_when_validation_has_one_class(tmp_path) -> None:
+    train = pd.DataFrame(
+        {
+            "x": [0.0, 0.1, 1.0, 1.1, 2.0, 2.1],
+            "label": ["SELL", "SELL", "HOLD", "HOLD", "BUY", "BUY"],
+        }
+    )
+    validation = pd.DataFrame({"x": [0.05, 1.05], "label": ["HOLD", "HOLD"]})
+
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        ScikitLearnTrainer(tmp_path / "legacy-model.joblib").train(
+            train_df=train,
+            validation_df=validation,
+            feature_columns=["x"],
+        )
+
+    assert not captured
 
 
 def test_lightgbm_trainer_reports_explicit_missing_dependency() -> None:

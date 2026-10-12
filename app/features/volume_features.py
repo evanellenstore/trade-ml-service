@@ -22,4 +22,5 @@ def add_volume_features(df: pd.DataFrame, rolling_window: int = 20) -> pd.DataFr
     result["relative_volume"] = volume / result["rolling_volume_mean"].replace(0, np.nan)
     result["volume_change_pct"] = result["volume_change_pct"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     result["relative_volume"] = result["relative_volume"].replace([np.inf, -np.inf], np.nan)
+    result.loc[result["volume"].eq(0), "relative_volume"] = 0.0
     return result

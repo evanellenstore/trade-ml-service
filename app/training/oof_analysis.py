@@ -4,14 +4,15 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, precision_recall_fscore_support
+from sklearn.metrics import accuracy_score, f1_score, precision_recall_fscore_support
 from pathlib import Path
 
 from app.domain.trading_style import TradingStyle
+from app.training.model_evaluator import ModelEvaluator
 
 
 OOF_CLASS_ORDER = ["SELL", "HOLD", "BUY"]
-DEFAULT_CONFIDENCE_THRESHOLDS = [0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
+DEFAULT_CONFIDENCE_THRESHOLDS = [0.40, 0.45, 0.50, 0.55, 0.60]
 DEFAULT_MARGIN_THRESHOLDS = [0.05, 0.10, 0.15, 0.20, 0.25]
 DEFAULT_COMBINED_THRESHOLDS = [
     {"confidenceThreshold": 0.60, "marginThreshold": 0.10},
@@ -118,12 +119,20 @@ class OOFAnalyzer:
             }
             for index, label in enumerate(OOF_CLASS_ORDER)
         }
+        directional = predicted.isin(("BUY", "SELL"))
+        directional_count = int(directional.sum())
         return {
             "coveragePct": float(len(selected) / total_count * 100.0) if total_count else 0.0,
             "predictionCount": int(len(selected)),
+            "directionalPredictionCount": directional_count,
+            "directionalPrecision": (
+                float((truth[directional] == predicted[directional]).mean())
+                if directional_count
+                else None
+            ),
             "metrics": {
                 "accuracy": float(accuracy_score(truth, predicted)),
-                "balancedAccuracy": float(balanced_accuracy_score(truth, predicted)),
+                "balancedAccuracy": float(ModelEvaluator.evaluate_predictions(truth, predicted, labels=OOF_CLASS_ORDER)["balancedAccuracy"]),
                 "macroF1": float(f1_score(truth, predicted, labels=OOF_CLASS_ORDER, average="macro", zero_division=0)),
             },
             **classes,
@@ -141,7 +150,7 @@ class OOFAnalyzer:
             fold_macro_f1.append(
                 float(f1_score(truth, predicted, labels=OOF_CLASS_ORDER, average="macro", zero_division=0))
             )
-            fold_balanced_accuracy.append(float(balanced_accuracy_score(truth, predicted)))
+            fold_balanced_accuracy.append(float(ModelEvaluator.evaluate_predictions(truth, predicted, labels=OOF_CLASS_ORDER)["balancedAccuracy"]))
             for label in OOF_CLASS_ORDER:
                 predicted_count = int(predicted.eq(label).sum())
                 fold_class_precision[label].append(
@@ -260,6 +269,7 @@ class OOFAnalyzer:
                     "grossReturnPct": gross_return_pct,
                     "netReturnPct": net_return_pct,
                     "costPct": round_trip_cost_pct,
+                    "entryTime": entry_time,
                     "exitTime": exit_time,
                 }
             )
@@ -283,6 +293,7 @@ class OOFAnalyzer:
                 "averageLossPct": None,
                 "grossReturnPct": 0.0,
                 "netReturnPct": 0.0,
+                "cagrEquivalentPct": None,
                 "roundTripCostPct": round_trip_cost_pct,
                 "profitFactor": None,
                 "profitFactorStatus": "NO_TRADES",
@@ -299,6 +310,11 @@ class OOFAnalyzer:
         drawdowns = (peaks[1:] - equity) / peaks[1:]
         gross_equity = float(np.prod(1.0 + gross_returns / 100.0))
         net_equity = float(equity[-1])
+        elapsed_days = max(
+            1.0,
+            (pd.Timestamp(trades[-1]["exitTime"]) - pd.Timestamp(trades[0]["entryTime"])).total_seconds() / 86400.0,
+        )
+        cagr_equivalent_pct = float((net_equity ** (365.0 / elapsed_days) - 1.0) * 100.0) if net_equity > 0.0 else None
         profit_factor = float(wins.sum() / abs(losses.sum())) if len(losses) else None
         return {
             **policy,
@@ -317,6 +333,7 @@ class OOFAnalyzer:
             "averageLossPct": float(losses.mean()) if len(losses) else 0.0,
             "grossReturnPct": float((gross_equity - 1.0) * 100.0),
             "netReturnPct": float((net_equity - 1.0) * 100.0),
+            "cagrEquivalentPct": cagr_equivalent_pct,
             "roundTripCostPct": round_trip_cost_pct,
             "profitFactor": profit_factor,
             "profitFactorStatus": "NO_LOSSES" if not len(losses) else "CALCULATED",
@@ -336,19 +353,22 @@ class OOFAnalyzer:
         combined_thresholds: list[dict[str, float]] | None = None,
         costs: dict[str, float] | None = None,
         capital_per_trade: float = 100000.0,
-        minimum_trade_count: int = 30,
-        maximum_drawdown_pct: float = 25.0,
+        minimum_trade_count: int = 100,
+        maximum_drawdown_pct: float = 10.0,
+        minimum_profit_factor: float = 1.5,
+        minimum_balanced_accuracy: float = 0.45,
+        minimum_macro_f1: float = 0.45,
         prediction_artifact_path: str | None = None,
     ) -> dict[str, Any]:
         confidence_thresholds = confidence_thresholds or DEFAULT_CONFIDENCE_THRESHOLDS
         margin_thresholds = margin_thresholds or DEFAULT_MARGIN_THRESHOLDS
         combined_thresholds = combined_thresholds or DEFAULT_COMBINED_THRESHOLDS
         costs = costs or {
-            "brokerage": 0.0,
-            "transactionCostPct": 0.0,
-            "slippagePct": 0.0,
-            "sttPct": 0.0,
-            "exchangeFeePct": 0.0,
+            "brokerage": 20.0,
+            "transactionCostPct": 0.01,
+            "slippagePct": 0.02,
+            "sttPct": 0.025,
+            "exchangeFeePct": 0.003,
         }
         oof_rows = pd.DataFrame.from_records(records)
         if oof_rows.empty:
@@ -358,6 +378,7 @@ class OOFAnalyzer:
             raise ValueError("WALK_FORWARD_OOF_DUPLICATE: a candle has multiple OOF predictions")
         oof_rows = oof_rows.sort_values(["timestamp", "candleId"], kind="mergesort").reset_index(drop=True)
         total_count = len(oof_rows)
+        overall_metrics = OOFAnalyzer._classification_metrics(oof_rows, total_count)
 
         confidence_analysis = []
         confidence_policies: list[tuple[pd.DataFrame, dict[str, Any]]] = []
@@ -517,7 +538,15 @@ class OOFAnalyzer:
                 backtest["tradeCount"] >= minimum_trade_count
                 and backtest["netReturnPct"] is not None
                 and backtest["netReturnPct"] > 0.0
-                and backtest["maxDrawdownPct"] <= maximum_drawdown_pct
+                and backtest["maxDrawdownPct"] < maximum_drawdown_pct
+                and backtest["profitFactor"] is not None
+                and backtest["profitFactor"] > float(minimum_profit_factor)
+                and backtest["expectancyPct"] is not None
+                and backtest["expectancyPct"] > 0.0
+                and overall_metrics["metrics"]["balancedAccuracy"] is not None
+                and overall_metrics["metrics"]["balancedAccuracy"] > float(minimum_balanced_accuracy)
+                and overall_metrics["metrics"]["macroF1"] is not None
+                and overall_metrics["metrics"]["macroF1"] > float(minimum_macro_f1)
             )
             ranked.append(
                 {
@@ -572,9 +601,44 @@ class OOFAnalyzer:
             [item for item in ranked if item["policy"]["policyType"] == "CONFIDENCE_AND_MARGIN"]
         )
 
+        confidence_backtests = {
+            item["confidenceThreshold"]: item
+            for item in backtests
+            if item["policyType"] == "CONFIDENCE"
+        }
+        confidence_metrics = {item["threshold"]: item for item in confidence_analysis}
+        for entry in confidence_analysis:
+            backtest = confidence_backtests.get(entry["threshold"], {})
+            entry["tradeCount"] = int(backtest.get("tradeCount", 0))
+            entry["winRate"] = backtest.get("winRate")
+            entry["profitFactor"] = backtest.get("profitFactor")
+            entry["netReturnPct"] = backtest.get("netReturnPct")
+            entry["maxDrawdownPct"] = backtest.get("maxDrawdownPct")
+            entry["directionalPrecision"] = confidence_metrics[entry["threshold"]].get("directionalPrecision")
+
+        selected_policy = recommendation
+        final_candidate = {
+            "eligible": bool(selected_policy and selected_policy.get("recommended")),
+            "criteria": {
+                "profitFactorGreaterThan": float(minimum_profit_factor),
+                "tradeCountAtLeast": int(minimum_trade_count),
+                "maxDrawdownLessThanPct": float(maximum_drawdown_pct),
+                "balancedAccuracyGreaterThan": float(minimum_balanced_accuracy),
+                "macroF1GreaterThan": float(minimum_macro_f1),
+                "positiveExpectancyAfterCosts": True,
+            },
+            "overallValidationMetrics": overall_metrics["metrics"],
+            "selectedPolicy": selected_policy,
+            "recommendation": (
+                "PRODUCTION_CANDIDATE" if selected_policy and selected_policy.get("recommended")
+                else "REJECT: no validation policy passed all production gates"
+            ),
+        }
+
         return {
             "predictionCount": int(total_count),
             "oofPredictionCount": int(total_count),
+            "overallValidationMetrics": overall_metrics,
             "predictionArtifact": prediction_artifact_path,
             "confidenceAnalysis": confidence_analysis,
             "marginAnalysis": margin_analysis,
@@ -582,6 +646,7 @@ class OOFAnalyzer:
             "signalPolicies": signal_policies,
             "backtests": backtests,
             "recommendation": recommendation,
+            "finalCandidateSelection": final_candidate,
             "bestConfidencePolicy": best_confidence_policy,
             "bestCombinedPolicy": best_combined_policy,
             "backtestAssumptions": {
@@ -596,5 +661,8 @@ class OOFAnalyzer:
                 "capitalPerTrade": float(capital_per_trade),
                 "minimumTradeCount": int(minimum_trade_count),
                 "maximumDrawdownPct": float(maximum_drawdown_pct),
+                "minimumProfitFactor": float(minimum_profit_factor),
+                "minimumBalancedAccuracy": float(minimum_balanced_accuracy),
+                "minimumMacroF1": float(minimum_macro_f1),
             },
         }

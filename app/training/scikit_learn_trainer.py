@@ -9,6 +9,8 @@ import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report
 
+from app.training.model_evaluator import CANONICAL_CLASS_ORDER
+
 
 class ScikitLearnTrainer:
     """Train and persist a deterministic classifier for the canonical feature schema."""
@@ -58,7 +60,8 @@ class ScikitLearnTrainer:
         model_report = classification_report(
             y_validation,
             validation_predictions,
-            labels=sorted(y_train.unique()),
+            labels=CANONICAL_CLASS_ORDER,
+            target_names=CANONICAL_CLASS_ORDER,
             output_dict=True,
             zero_division=0,
         )

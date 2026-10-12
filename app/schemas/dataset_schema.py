@@ -71,6 +71,8 @@ class FeatureValidationAudit(BaseModel):
     beforeFiltering: FeatureValidationSummary
     afterFiltering: FeatureValidationSummary
     featureWarmupRows: int = 0
+    featureInternalInvalidRows: int = 0
+    perFeature: dict[str, dict[str, int | str | None]] = Field(default_factory=dict)
 
 
 class DatasetSummary(BaseModel):
@@ -89,7 +91,7 @@ class DatasetSummary(BaseModel):
     datasetRowCount: int
     skippedRowCount: int
     featureCount: int
-    featureVersion: str = "v1"
+    featureVersion: str = "v3"
     labelDistribution: dict[str, int]
     featureSchema: Optional[FeatureSchemaSummary] = None
     skipReasons: Optional[dict[str, int]] = None

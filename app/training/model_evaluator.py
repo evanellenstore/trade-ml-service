@@ -7,12 +7,13 @@ import pandas as pd
 from sklearn.dummy import DummyClassifier
 from sklearn.metrics import (
     accuracy_score,
-    balanced_accuracy_score,
     confusion_matrix,
     f1_score,
     log_loss,
     precision_recall_fscore_support,
 )
+
+from app.features.feature_schema import FEATURE_SCHEMA
 
 CANONICAL_CLASS_ORDER = ["SELL", "HOLD", "BUY"]
 
@@ -100,11 +101,6 @@ class ModelEvaluator:
         label_order = list(labels) if labels is not None else ModelEvaluator.canonical_label_order(truth)
         if not label_order:
             label_order = list(CANONICAL_CLASS_ORDER)
-        defined_order = [label for label in label_order if label in set(truth.unique()).union(set(preds.unique()))]
-        if not defined_order:
-            defined_order = list(CANONICAL_CLASS_ORDER)
-        if len(defined_order) != len(label_order):
-            label_order = defined_order
         cm = confusion_matrix(truth, preds, labels=label_order)
         precision, recall, f1, support = precision_recall_fscore_support(
             truth,
@@ -113,9 +109,11 @@ class ModelEvaluator:
             average=None,
             zero_division=0,
         )
+        present_class_mask = support > 0
+        balanced_accuracy = float(np.mean(recall[present_class_mask])) if present_class_mask.any() else 0.0
         metrics = {
             "accuracy": float(accuracy_score(truth, preds)),
-            "balancedAccuracy": float(balanced_accuracy_score(truth, preds)),
+            "balancedAccuracy": balanced_accuracy,
             "macroPrecision": float(np.mean(precision)),
             "macroRecall": float(np.mean(recall)),
             "macroF1": float(f1_score(truth, preds, labels=label_order, average="macro", zero_division=0)),
@@ -139,10 +137,20 @@ class ModelEvaluator:
         labels: list[str] | None = None,
     ) -> float:
         truth = pd.Series(y_true).astype(str)
-        label_order = labels or sorted(truth.unique())
-        if probabilities.ndim == 1:
-            raise ValueError("Predict-proba probabilities must be 2D")
-        return float(log_loss(truth, probabilities, labels=label_order))
+        label_order = list(labels or CANONICAL_CLASS_ORDER)
+        probabilities = np.asarray(probabilities, dtype=float)
+        if probabilities.ndim != 2 or probabilities.shape != (len(truth), len(label_order)):
+            raise ValueError("Predict-proba probabilities must align with rows and the supplied label order")
+        if not np.isfinite(probabilities).all() or (probabilities < 0.0).any():
+            raise ValueError("Predict-proba probabilities contain invalid values")
+        if not np.allclose(probabilities.sum(axis=1), 1.0, atol=1e-6):
+            raise ValueError("Predict-proba probability rows must sum to one")
+        label_indices = {label: index for index, label in enumerate(label_order)}
+        unknown = sorted(set(truth.unique()) - set(label_indices))
+        if unknown:
+            raise ValueError(f"Log-loss labels are not represented in the probability axis: {unknown}")
+        encoded_truth = truth.map(label_indices).to_numpy(dtype=int)
+        return float(log_loss(encoded_truth, probabilities, labels=list(range(len(label_order)))))
 
     @staticmethod
     def confidence_analysis(
@@ -152,7 +160,7 @@ class ModelEvaluator:
         thresholds: list[float] | None = None,
     ) -> list[dict[str, Any]]:
         truth = pd.Series(y_true).astype(str)
-        label_order = labels or sorted(truth.unique())
+        label_order = list(labels or CANONICAL_CLASS_ORDER)
         thresholds = thresholds or [0.4, 0.5, 0.6, 0.7, 0.8]
         if probabilities.ndim == 1:
             raise ValueError("Predict-proba probabilities must be 2D")
@@ -252,6 +260,136 @@ class ModelEvaluator:
             {"feature": feature, "importance": float(score)}
             for feature, score in ranked
         ]
+
+    @staticmethod
+    def feature_importance_report(
+        model: Any,
+        feature_names: list[str],
+        X_validation: pd.DataFrame,
+        y_validation: pd.Series | list[str] | np.ndarray,
+        *,
+        permutation_repeats: int = 5,
+        random_state: int = 42,
+        minimum_importance_pct: float = 0.5,
+    ) -> dict[str, Any]:
+        """Rank features with booster gain/weight and validation permutation importance."""
+        if len(feature_names) != len(FEATURE_SCHEMA.columns) or list(feature_names) != FEATURE_SCHEMA.columns:
+            raise ValueError("Feature importance requires the canonical feature schema")
+        if X_validation.empty or len(X_validation) != len(y_validation):
+            raise ValueError("Feature importance requires aligned validation rows and labels")
+
+        estimators = [getattr(model, "estimator", model)]
+        if hasattr(model, "calibrated_classifiers_"):
+            estimators = [
+                getattr(item, "estimator", getattr(item, "base_estimator", None))
+                for item in model.calibrated_classifiers_
+            ]
+            estimators = [getattr(item, "estimator", item) for item in estimators if item is not None]
+
+        def expand(values: dict[str, float]) -> np.ndarray:
+            scores = np.zeros(len(feature_names), dtype=float)
+            for index, name in enumerate(feature_names):
+                scores[index] = float(values.get(name, values.get(f"f{index}", 0.0)))
+            return scores
+
+        gain_arrays = []
+        weight_arrays = []
+        for estimator in estimators:
+            booster = estimator.get_booster() if hasattr(estimator, "get_booster") else None
+            if booster is not None:
+                gain_arrays.append(expand(booster.get_score(importance_type="gain")))
+                weight_arrays.append(expand(booster.get_score(importance_type="weight")))
+            elif hasattr(estimator, "feature_importances_"):
+                gain_arrays.append(np.asarray(estimator.feature_importances_, dtype=float))
+                weight_arrays.append(np.zeros(len(feature_names), dtype=float))
+        gain = np.mean(gain_arrays, axis=0) if gain_arrays else np.zeros(len(feature_names), dtype=float)
+        weight = np.mean(weight_arrays, axis=0) if weight_arrays else np.zeros(len(feature_names), dtype=float)
+        truth = pd.Series(y_validation).astype(str).reset_index(drop=True)
+        validation = X_validation.loc[:, feature_names].reset_index(drop=True).copy()
+        if len(validation) > 2000:
+            sample = np.random.default_rng(random_state).choice(len(validation), size=2000, replace=False)
+            validation = validation.iloc[sample].reset_index(drop=True)
+            truth = truth.iloc[sample].reset_index(drop=True)
+        random = np.random.default_rng(random_state)
+
+        def decode_predictions(values: np.ndarray) -> list[str]:
+            predictions = np.asarray(values)
+            if np.issubdtype(predictions.dtype, np.number):
+                if not np.equal(predictions, np.floor(predictions)).all():
+                    raise ValueError("Classifier predictions are not discrete class identifiers")
+                return [CANONICAL_CLASS_ORDER[int(value)] for value in predictions]
+            return predictions.astype(str).tolist()
+
+        baseline = ModelEvaluator.evaluate_predictions(
+            truth,
+            decode_predictions(model.predict(validation)),
+            labels=CANONICAL_CLASS_ORDER,
+        )["macroF1"]
+        permutation = np.zeros(len(feature_names), dtype=float)
+        for index, feature in enumerate(feature_names):
+            score_drops = []
+            for _ in range(max(1, permutation_repeats)):
+                permuted = validation.copy()
+                permuted[feature] = random.permutation(permuted[feature].to_numpy())
+                predictions = decode_predictions(model.predict(permuted))
+                permuted_score = ModelEvaluator.evaluate_predictions(
+                    truth,
+                    predictions,
+                    labels=CANONICAL_CLASS_ORDER,
+                )["macroF1"]
+                score_drops.append(max(0.0, float(baseline) - float(permuted_score)))
+            permutation[index] = float(np.mean(score_drops))
+
+        def percentages(scores: np.ndarray) -> np.ndarray:
+            total = float(scores.sum())
+            return scores / total * 100.0 if total > 0.0 else np.zeros_like(scores)
+
+        gain_pct = percentages(np.maximum(gain, 0.0))
+        weight_pct = percentages(np.maximum(weight, 0.0))
+        permutation_pct = percentages(np.maximum(permutation, 0.0))
+        combined_pct = (gain_pct + weight_pct + permutation_pct) / 3.0
+        ranking = [
+            {
+                "feature": feature,
+                "gain": float(gain[index]),
+                "gainImportancePct": float(gain_pct[index]),
+                "weight": float(weight[index]),
+                "weightImportancePct": float(weight_pct[index]),
+                "permutationImportance": float(permutation[index]),
+                "permutationImportancePct": float(permutation_pct[index]),
+                "combinedImportancePct": float(combined_pct[index]),
+            }
+            for index, feature in enumerate(feature_names)
+        ]
+        ranking.sort(key=lambda item: item["combinedImportancePct"], reverse=True)
+        return {
+            "ranking": ranking,
+            "top10": ranking[:10],
+            "bottom10": ranking[-10:],
+            "belowMinimumImportance": [
+                item["feature"]
+                for item in ranking
+                if item["combinedImportancePct"] < minimum_importance_pct
+            ],
+            "minimumImportancePct": float(minimum_importance_pct),
+            "permutationRepeats": max(1, permutation_repeats),
+            "permutationSampleCount": int(len(validation)),
+            "scoringMetric": "macroF1",
+            "validationOnly": True,
+        }
+
+    @staticmethod
+    def has_tree_importance(model: Any) -> bool:
+        def supports_importance(estimator: Any) -> bool:
+            estimator = getattr(estimator, "estimator", estimator)
+            return hasattr(estimator, "get_booster") or hasattr(estimator, "feature_importances_")
+
+        if hasattr(model, "calibrated_classifiers_"):
+            return any(
+                supports_importance(getattr(item, "estimator", getattr(item, "base_estimator", item)))
+                for item in model.calibrated_classifiers_
+            )
+        return supports_importance(model)
 
     @staticmethod
     def compare_with_baselines(

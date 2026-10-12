@@ -156,8 +156,8 @@ class TargetAnalysisService:
 
     @staticmethod
     def _threshold_analysis(values: pd.Series, threshold: float) -> ThresholdAnalysis:
-        buy_count = int((values >= threshold).sum())
-        sell_count = int((values <= -threshold).sum())
+        buy_count = int((values > threshold).sum())
+        sell_count = int((values < -threshold).sum())
         hold_count = int(len(values) - buy_count - sell_count)
         total = len(values)
         percentages = [count / total * 100.0 for count in (buy_count, hold_count, sell_count)] if total else [0.0] * 3

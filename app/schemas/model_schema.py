@@ -37,7 +37,7 @@ class OOFAnalysisConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     confidenceThresholds: list[float] = Field(
-        default_factory=lambda: [0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80],
+        default_factory=lambda: [0.40, 0.45, 0.50, 0.55, 0.60],
         min_length=1,
     )
     marginThresholds: list[float] = Field(
@@ -51,14 +51,17 @@ class OOFAnalysisConfig(BaseModel):
             OOFCombinedThreshold(confidenceThreshold=0.70, marginThreshold=0.20),
         ]
     )
-    brokerage: float = Field(default=0.0, ge=0.0)
-    transactionCostPct: float = Field(default=0.0, ge=0.0)
-    slippagePct: float = Field(default=0.0, ge=0.0)
-    sttPct: float = Field(default=0.0, ge=0.0)
-    exchangeFeePct: float = Field(default=0.0, ge=0.0)
+    brokerage: float = Field(default=20.0, ge=0.0)
+    transactionCostPct: float = Field(default=0.01, ge=0.0)
+    slippagePct: float = Field(default=0.02, ge=0.0)
+    sttPct: float = Field(default=0.025, ge=0.0)
+    exchangeFeePct: float = Field(default=0.003, ge=0.0)
     capitalPerTrade: float = Field(default=100000.0, gt=0.0)
-    minimumTradeCount: int = Field(default=30, ge=1)
-    maximumDrawdownPct: float = Field(default=25.0, gt=0.0)
+    minimumTradeCount: int = Field(default=100, ge=1)
+    maximumDrawdownPct: float = Field(default=10.0, gt=0.0)
+    minimumProfitFactor: float = Field(default=1.5, gt=0.0)
+    minimumBalancedAccuracy: float = Field(default=0.45, ge=0.0, le=1.0)
+    minimumMacroF1: float = Field(default=0.45, ge=0.0, le=1.0)
 
     @field_validator("confidenceThresholds", "marginThresholds")
     @classmethod
@@ -100,6 +103,22 @@ class ModelTrainingResponse(BaseModel):
     success: bool
     message: str
     data: dict
+
+
+class TargetEvaluationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    symbolToken: str = Field(..., min_length=1)
+    startTime: Optional[datetime] = None
+    endTime: Optional[datetime] = None
+
+    @field_validator("endTime")
+    @classmethod
+    def validate_time_range(cls, value: Optional[datetime], info) -> Optional[datetime]:
+        start_time = info.data.get("startTime")
+        if value is not None and start_time is not None and value < start_time:
+            raise ValueError("endTime must be greater than or equal to startTime")
+        return value
 
 
 class PredictionRequest(BaseModel):

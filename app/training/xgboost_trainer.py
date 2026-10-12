@@ -9,9 +9,10 @@ from typing import Any
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.dummy import DummyClassifier
 from sklearn.metrics import log_loss
 
-from app.features.feature_schema import FEATURE_SCHEMA
+from app.features.feature_schema import FEATURE_COUNT, FEATURE_SCHEMA
 from app.training.model_evaluator import ModelEvaluator
 
 CANONICAL_CLASS_ORDER = ["SELL", "HOLD", "BUY"]
@@ -33,6 +34,7 @@ class XGBoostTrainer:
         self.model_path = Path(model_path)
         self.random_state = random_state
 
+
     @staticmethod
     def validate_feature_matrix(
         df: pd.DataFrame,
@@ -42,8 +44,8 @@ class XGBoostTrainer:
     ) -> pd.DataFrame:
         if not feature_columns:
             raise ValueError("At least one feature column is required")
-        if len(feature_columns) != 26:
-            raise ValueError(f"feature count must be 26; received {len(feature_columns)}")
+        if len(feature_columns) != FEATURE_COUNT:
+            raise ValueError(f"feature count must be {FEATURE_COUNT}; received {len(feature_columns)}")
         if list(feature_columns) != list(FEATURE_SCHEMA.columns):
             raise ValueError("feature names or order do not match the canonical schema")
 
@@ -126,36 +128,60 @@ class XGBoostTrainer:
         hyperparameters: dict[str, Any],
         label_order: list[str],
     ) -> dict[str, Any]:
-        y_train_encoded = self._encode_canonical_labels(y_train)
-        y_validation_encoded = self._encode_canonical_labels(y_validation)
-        model = XGBClassifier(
-            objective="multi:softprob",
-            eval_metric="mlogloss",
-            n_estimators=hyperparameters.get("n_estimators", 200),
-            max_depth=int(hyperparameters.get("max_depth", 5)),
-            learning_rate=float(hyperparameters.get("learning_rate", 0.05)),
-            subsample=float(hyperparameters.get("subsample", 0.85)),
-            colsample_bytree=float(hyperparameters.get("colsample_bytree", 0.85)),
-            min_child_weight=int(hyperparameters.get("min_child_weight", 1)),
-            gamma=float(hyperparameters.get("gamma", 0.0)),
-            reg_alpha=float(hyperparameters.get("reg_alpha", 0.0)),
-            reg_lambda=float(hyperparameters.get("reg_lambda", 1.0)),
-            random_state=self.random_state,
-            n_jobs=1,
-            early_stopping_rounds=int(hyperparameters.get("early_stopping_rounds", 20)),
+        normalized_train = pd.Series(y_train).astype(str).reset_index(drop=True)
+        local_classes = [label for label in CANONICAL_CLASS_ORDER if label in set(normalized_train)]
+        if not local_classes:
+            raise ValueError("Training fold contains no canonical target classes")
+        local_encoding = {label: index for index, label in enumerate(local_classes)}
+        y_train_encoded = normalized_train.map(local_encoding).to_numpy(dtype=int)
+        normalized_validation = pd.Series(y_validation).astype(str).reset_index(drop=True)
+        validation_mask = normalized_validation.isin(local_classes).to_numpy()
+        if len(local_classes) == 1:
+            model = DummyClassifier(strategy="constant", constant=0)
+            model.fit(X_train, y_train_encoded)
+        else:
+            model_kwargs = {
+                "objective": "binary:logistic" if len(local_classes) == 2 else "multi:softprob",
+                "eval_metric": "logloss" if len(local_classes) == 2 else "mlogloss",
+                "n_estimators": hyperparameters.get("n_estimators", 200),
+                "max_depth": int(hyperparameters.get("max_depth", 5)),
+                "learning_rate": float(hyperparameters.get("learning_rate", 0.05)),
+                "subsample": float(hyperparameters.get("subsample", 0.85)),
+                "colsample_bytree": float(hyperparameters.get("colsample_bytree", 0.85)),
+                "min_child_weight": int(hyperparameters.get("min_child_weight", 1)),
+                "gamma": float(hyperparameters.get("gamma", 0.0)),
+                "reg_alpha": float(hyperparameters.get("reg_alpha", 0.0)),
+                "reg_lambda": float(hyperparameters.get("reg_lambda", 1.0)),
+                "random_state": self.random_state,
+                "n_jobs": 1,
+            }
+            if len(local_classes) > 2:
+                model_kwargs["num_class"] = len(local_classes)
+            eval_set = []
+            if validation_mask.any():
+                model_kwargs["early_stopping_rounds"] = int(hyperparameters.get("early_stopping_rounds", 20))
+                eval_set = [
+                    (
+                        X_validation.loc[validation_mask],
+                        normalized_validation.loc[validation_mask].map(local_encoding).to_numpy(dtype=int),
+                    )
+                ]
+            model = XGBClassifier(**model_kwargs)
+            model.fit(X_train, y_train_encoded, eval_set=eval_set or None, verbose=False)
+        adapted_model = CanonicalClassAdapter(model, local_classes)
+        validation_probabilities = adapted_model.predict_proba(X_validation)
+        validation_predictions_labels = np.asarray(
+            [CANONICAL_CLASS_ORDER[index] for index in adapted_model.predict(X_validation)],
+            dtype=object,
         )
-        model.fit(
-            X_train,
-            y_train_encoded,
-            eval_set=[(X_validation, y_validation_encoded)],
-            verbose=False,
-        )
-        model.canonical_class_order_ = np.asarray(CANONICAL_CLASS_ORDER, dtype=object)
-        validation_probabilities = model.predict_proba(X_validation)
-        validation_predictions = model.predict(X_validation)
-        validation_predictions_labels = self._decode_canonical_labels(validation_predictions)
         metrics = ModelEvaluator.evaluate_predictions(y_validation, validation_predictions_labels, labels=label_order)
-        metrics["logLoss"] = float(log_loss(y_validation, validation_probabilities, labels=CANONICAL_CLASS_ORDER))
+        metrics["logLoss"] = float(
+            ModelEvaluator.log_loss_metrics(
+                y_validation,
+                validation_probabilities,
+                labels=CANONICAL_CLASS_ORDER,
+            )
+        )
         metrics["bestIteration"] = getattr(model, "best_iteration", None)
         metrics["bestScore"] = getattr(model, "best_score", None)
         return {
@@ -163,8 +189,8 @@ class XGBoostTrainer:
             "validationMetrics": metrics,
             "validation_accuracy": float(metrics["accuracy"]),
             "probabilities": validation_probabilities,
-            "trainedModel": model,
-            "labelEncoder": {"mapping": CANONICAL_CLASS_ENCODING, "reverseMapping": CANONICAL_CLASS_DECODING},
+            "trainedModel": adapted_model,
+            "labelEncoder": {"mapping": local_encoding, "reverseMapping": {value: key for key, value in local_encoding.items()}},
         }
 
     def train(
@@ -183,13 +209,13 @@ class XGBoostTrainer:
             )
         X_train = self.validate_feature_matrix(train_df, feature_columns)
         X_validation = self.validate_feature_matrix(validation_df, feature_columns)
-        if X_train.shape != (len(train_df), 26):
-            raise ValueError(f"X_train shape mismatch: expected {(len(train_df), 26)}, received {X_train.shape}")
-        if X_validation.shape != (len(validation_df), 26):
-            raise ValueError(f"X_validation shape mismatch: expected {(len(validation_df), 26)}, received {X_validation.shape}")
+        if X_train.shape != (len(train_df), FEATURE_COUNT):
+            raise ValueError(f"X_train shape mismatch: expected {(len(train_df), FEATURE_COUNT)}, received {X_train.shape}")
+        if X_validation.shape != (len(validation_df), FEATURE_COUNT):
+            raise ValueError(f"X_validation shape mismatch: expected {(len(validation_df), FEATURE_COUNT)}, received {X_validation.shape}")
         y_train = train_df[label_column].astype(str)
         y_validation = validation_df[label_column].astype(str)
-        label_order = list(dict.fromkeys([*y_train.unique(), *y_validation.unique()]))
+        label_order = list(CANONICAL_CLASS_ORDER)
         if len(label_order) < 2:
             raise ValueError("Training data must contain at least two target classes")
         params = hyperparameters or {
@@ -253,7 +279,7 @@ class XGBoostTrainer:
         X_validation = self.validate_feature_matrix(validation_df, feature_columns)
         y_train = train_df[label_column].astype(str)
         y_validation = validation_df[label_column].astype(str)
-        label_order = list(dict.fromkeys([*y_train.unique(), *y_validation.unique()]))
+        label_order = list(CANONICAL_CLASS_ORDER)
         candidates = self._candidate_grid()[:candidate_count]
         leaderboard: list[dict[str, Any]] = []
         for params in candidates:
@@ -282,3 +308,47 @@ class XGBoostTrainer:
             "bestValidationMetrics": best["validationMetrics"],
             "bestModel": best,
         }
+
+
+class CanonicalClassAdapter:
+    """Expose a fold-specific classifier on the stable SELL/HOLD/BUY axis."""
+
+    def __init__(self, estimator: Any, local_classes: list[str]) -> None:
+        self.estimator = estimator
+        self.local_classes = list(local_classes)
+        self.classes_ = np.arange(len(CANONICAL_CLASS_ORDER))
+
+    def predict(self, matrix: pd.DataFrame) -> np.ndarray:
+        local_predictions = np.asarray(self.estimator.predict(matrix), dtype=int)
+        return np.asarray(
+            [CANONICAL_CLASS_ORDER.index(self.local_classes[int(value)]) for value in local_predictions],
+            dtype=int,
+        )
+
+    def predict_proba(self, matrix: pd.DataFrame) -> np.ndarray:
+        local_probabilities = np.asarray(self.estimator.predict_proba(matrix), dtype=float)
+        aligned = np.zeros((len(local_probabilities), len(CANONICAL_CLASS_ORDER)), dtype=float)
+        estimator_classes = np.asarray(
+            getattr(self.estimator, "classes_", np.arange(len(self.local_classes))),
+            dtype=int,
+        )
+        for local_column, estimator_class in enumerate(estimator_classes):
+            label = self.local_classes[int(estimator_class)]
+            aligned[:, CANONICAL_CLASS_ORDER.index(label)] = local_probabilities[:, local_column]
+        row_sums = aligned.sum(axis=1, keepdims=True)
+        return np.divide(aligned, row_sums, out=np.zeros_like(aligned), where=row_sums > 0.0)
+
+    def get_booster(self):
+        return self.estimator.get_booster() if hasattr(self.estimator, "get_booster") else None
+
+    @property
+    def feature_importances_(self) -> np.ndarray:
+        return np.asarray(getattr(self.estimator, "feature_importances_", []), dtype=float)
+
+    @property
+    def n_features_in_(self) -> int:
+        if hasattr(self.estimator, "n_features_in_"):
+            return int(self.estimator.n_features_in_)
+        if hasattr(self.estimator, "get_booster"):
+            return int(self.estimator.get_booster().num_features())
+        raise AttributeError("Wrapped estimator does not expose its input feature count")

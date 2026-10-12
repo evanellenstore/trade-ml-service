@@ -5,11 +5,33 @@ import logging
 from fastapi import APIRouter, HTTPException
 
 from app.prediction.prediction_service import PredictionService
-from app.schemas.model_schema import ModelTrainRequest, ModelTrainingResponse, PredictionRequest
+from app.schemas.model_schema import (
+    ModelTrainRequest,
+    ModelTrainingResponse,
+    PredictionRequest,
+    TargetEvaluationRequest,
+)
+from app.training.experiment_runner import ExperimentRunner
 from app.training.model_training_service import ModelTrainingService
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1")
+
+
+@router.post("/model/evaluate-targets")
+def evaluate_targets(payload: TargetEvaluationRequest) -> dict:
+    try:
+        return ExperimentRunner().run_all(
+            symbol_token=payload.symbolToken,
+            start_time=payload.startTime,
+            end_time=payload.endTime,
+        )
+    except ValueError as exc:
+        logger.warning("Target evaluation failed validation: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Target evaluation failed")
+        raise HTTPException(status_code=500, detail="Target evaluation failed") from exc
 
 
 @router.post("/model/train", response_model=ModelTrainingResponse)

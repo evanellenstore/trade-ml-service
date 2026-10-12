@@ -10,14 +10,20 @@ from app.features.feature_leakage import FeatureLeakageValidator
 
 
 def _synthetic_frame() -> pd.DataFrame:
-    rows = 60
+    rows = 360
     close = 100.0 + np.arange(rows, dtype=float) * 0.5
+    candle_times = []
+    for day in pd.date_range("2026-01-01", periods=(rows // 75) + 1, freq="B"):
+        candle_times.extend(pd.date_range(day + pd.Timedelta(hours=9, minutes=15), periods=75, freq="5min"))
+        if len(candle_times) >= rows:
+            break
+    candle_times = candle_times[:rows]
     return pd.DataFrame(
         {
             "symbol_token": ["100"] * rows,
             "timeframe": ["FIVE_MINUTE"] * rows,
             "trading_date": pd.date_range("2026-01-01", periods=rows, freq="min").date,
-            "candle_time": pd.date_range("2026-01-01", periods=rows, freq="min"),
+            "candle_time": candle_times,
             "open": close,
             "high": close + 0.2,
             "low": close - 0.2,
@@ -66,14 +72,14 @@ def test_return_5_and_return_15_are_backward_looking():
 def test_future_mutation_does_not_change_features_at_timestamp_t():
     frame = _synthetic_frame()
     engineered = FeatureEngineering().transform(frame)
-    before = FeatureEngineering().feature_matrix(engineered).loc[20].copy()
+    before = FeatureEngineering().feature_matrix(engineered.iloc[[300]]).iloc[0].copy()
 
     mutated = frame.copy()
-    mutated.loc[21:60, "close"] = 1000.0
-    mutated.loc[21:60, "high"] = 1000.2
-    mutated.loc[21:60, "low"] = 999.8
-    mutated.loc[21:60, "volume"] = 1000.0
-    after = FeatureEngineering().feature_matrix(FeatureEngineering().transform(mutated)).loc[20]
+    mutated.loc[301:359, "close"] = 1000.0
+    mutated.loc[301:359, "high"] = 1000.2
+    mutated.loc[301:359, "low"] = 999.8
+    mutated.loc[301:359, "volume"] = 1000.0
+    after = FeatureEngineering().feature_matrix(FeatureEngineering().transform(mutated).iloc[[300]]).iloc[0]
 
     pd.testing.assert_series_equal(before, after, check_exact=False, rtol=1e-12, atol=1e-12)
 
@@ -84,22 +90,22 @@ def test_future_target_mutation_does_not_change_features():
     engineered["future_close"] = engineered["close"] + 1.0
     engineered["future_return_pct"] = 1.0
     engineered["label"] = "BUY"
-    before = FeatureEngineering().feature_matrix(engineered).loc[20].copy()
+    before = FeatureEngineering().feature_matrix(engineered.iloc[[300]]).iloc[0].copy()
 
     target_mutated = engineered.copy()
-    target_mutated.loc[20, "future_close"] = 2000.0
-    target_mutated.loc[20, "future_return_pct"] = 1900.0
-    target_mutated.loc[20, "label"] = "SELL"
-    after = FeatureEngineering().feature_matrix(target_mutated).loc[20]
+    target_mutated.loc[300, "future_close"] = 2000.0
+    target_mutated.loc[300, "future_return_pct"] = 1900.0
+    target_mutated.loc[300, "label"] = "SELL"
+    after = FeatureEngineering().feature_matrix(target_mutated.iloc[[300]]).iloc[0]
 
     pd.testing.assert_series_equal(before, after, check_exact=False, rtol=1e-12, atol=1e-12)
 
 
 def test_feature_matrix_is_exact_schema_and_contains_no_future_columns():
     frame = _synthetic_frame()
-    matrix = FeatureEngineering().feature_matrix(FeatureEngineering().transform(frame))
+    matrix = FeatureEngineering().feature_matrix(FeatureEngineering().transform(frame).iloc[300:])
     assert list(matrix.columns) == FEATURE_SCHEMA.columns
-    assert matrix.shape[1] == 26
+    assert matrix.shape[1] == len(FEATURE_SCHEMA.columns)
     assert not matrix.isna().any().any()
     assert np.isfinite(matrix.to_numpy(dtype=float)).all()
 
@@ -115,7 +121,7 @@ def test_validator_rejects_target_columns_in_feature_matrix():
     frame = _synthetic_frame()
     engineered = FeatureEngineering().transform(frame)
     engineered["future_close"] = 1.0
-    matrix = FeatureEngineering().feature_matrix(engineered)
+    matrix = FeatureEngineering().feature_matrix(engineered.iloc[[300]])
     matrix["future_close"] = 1.0
 
     validator = FeatureLeakageValidator().validate(matrix)
